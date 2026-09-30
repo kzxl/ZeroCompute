@@ -31,7 +31,7 @@ Level 5: Memory-Level Parallelism (Line Fill Buffer Saturation, Prefetching & St
 ```
 
 - **Axiom: Parallelism $\neq$ Performance**: Never naively assumes more threads equals faster throughput. The `ExecutionPlanner` profiles arithmetic intensity ($I = \text{FLOPs}/\text{Byte}$), working-set cache sizing, and CPU microarchitecture to choose between Sequential, Single-Core SIMD, or Multi-Core Cache-Tiled execution.
-- **Sovereign Worker Pool (`ComputeWorkerPool`)**: Pre-spawned, background threads pinned to discrete physical cores via Win32 `SetThreadAffinityMask`. SMT/Hyperthreading is selectively bypassed for compute-bound kernels to eliminate contention on shared FPU execution pipelines.
+- **Sovereign Worker Pool (`ComputeWorkerPool`)**: Pre-spawned, background threads pinned to discrete physical cores via cross-platform affinity (Win32 `SetThreadAffinityMask` on Windows and `libc sched_setaffinity` on Linux with `/proc/cpuinfo` topology detection). SMT/Hyperthreading is selectively bypassed for compute-bound kernels to eliminate contention on shared FPU execution pipelines.
 - **Dynamic Lock-Free Chunk Stealing**: Atomic chunk consumption balances heterogeneous architectures (e.g. Intel Alder Lake / Raptor Lake P-cores and E-cores) with zero task queue locking.
 - **Microsecond Dispatch Latency**: Hybrid spin-wait barriers (10 spins $\to$ `Thread.Yield()` $\to$ private `AutoResetEvent`) achieve **$1.85 \ \mu\text{s}$** dispatch latency ($2.0\times$ faster than standard .NET `Parallel.For`).
 - **SIMD Padé Rational Approximation**: Vectorizes transcendental activations (`GELU`, `Tanh`) using a high-precision rational polynomial, converting scalar branching into pure SIMD FMA instructions (**$5.99\times$ speedup**).
