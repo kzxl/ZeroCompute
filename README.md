@@ -6,7 +6,7 @@
 [![CPU Runtime](https://img.shields.io/badge/CPU-Multi--Level%20Parallel%20Runtime-emerald.svg)]()
 [![Direct3D 11 Compute](https://img.shields.io/badge/GPU-Direct3D%2011%20Compute-orange.svg)]()
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-0%20(Pure%20C%23)-brightgreen.svg)]()
-[![NuGet Version](https://img.shields.io/badge/NuGet-1.2.0-blue.svg)](https://www.nuget.org/packages/ZeroCompute.Core)
+[![NuGet Version](https://img.shields.io/badge/NuGet-1.3.0-blue.svg)](https://www.nuget.org/packages/ZeroCompute.Core)
 
 **ZeroCompute** is a high-performance, dual-engine compute execution framework for .NET with **zero external dependencies**. It provides:
 1. A **CPU Parallel Compute Runtime** that systematically exploits all 5 levels of CPU parallelism (Core, Cache Tiling, SIMD, Instruction-Level Parallelism, and Memory-Level Parallelism).
@@ -36,6 +36,7 @@ Level 5: Memory-Level Parallelism (Line Fill Buffer Saturation, Prefetching & St
 - **Microsecond Dispatch Latency**: Hybrid spin-wait barriers (10 spins $\to$ `Thread.Yield()` $\to$ private `AutoResetEvent`) achieve **$1.85 \ \mu\text{s}$** dispatch latency ($2.0\times$ faster than standard .NET `Parallel.For`).
 - **SIMD Padé Rational Approximation**: Vectorizes transcendental activations (`GELU`, `Tanh`) using a high-precision rational polynomial, converting scalar branching into pure SIMD FMA instructions (**$5.99\times$ speedup**).
 - **Cache-Aware 2D Tiling**: $64 \times 64$ sub-matrix tiling ($16\text{ KB}$) ensures temporal working sets fit entirely inside private L1/L2 data caches (**$4.18\times$ speedup** on GEMM).
+- **NUMA-Node Awareness & Sovereign Memory Affinity**: Dynamic multi-socket NUMA discovery (Windows `GetNumaHighestNodeNumber` / Linux `/sys/devices/system/node`) and node-local unmanaged memory allocation (`VirtualAllocExNuma` / Linux `mmap`) eliminating cross-socket QPI/UPI interconnect latency bottlenecks.
 - **Direct3D 11 GPGPU Acceleration**: Seamless GPU offloading for massive tensor matrix operations via native DirectX 11 compute shaders.
 - **100% Pure C#**: Multi-targeting `net8.0`, `netstandard2.0`, and `net462` with zero native DLL dependencies.
 
@@ -149,6 +150,21 @@ var b = Tensor.RandomUniform(1024, 1024);
 
 // Executes GEMM on selected hardware
 var c = ctx.Gemm(a, b);
+```
+
+### 7. NUMA-Node Topology & Domain Allocation
+
+```csharp
+using ZeroCompute.Core.Cpu;
+
+// Query system NUMA topology (Windows & Linux dual-socket / multi-socket)
+int nodeCount = NumaTopology.GetNodeCount();
+Console.WriteLine($"System NUMA Nodes: {nodeCount}, Dual-Socket Detected: {NumaTopology.IsDualSocketOrGreater()}");
+
+// Allocate 64MB pin-bound directly on NUMA node 0 memory controller
+using var memory = NumaTopology.Allocate(64 * 1024 * 1024, preferredNode: 0);
+Span<byte> span = memory.AsSpan();
+span.Fill(0xAA);
 ```
 
 ---
