@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using ZeroCompute.Core.Context;
+using ZeroCompute.Core.Cpu;
 using ZeroTensor.Core;
 
 namespace ZeroCompute.Core.Blas
@@ -57,7 +58,7 @@ namespace ZeroCompute.Core.Blas
                 // Handle beta scaling first if needed
                 if (beta == 0.0f)
                 {
-                    Parallel.For(0, (totalElements + 1023) / 1024, chunk =>
+                    Compute.For((totalElements + 1023) / 1024, chunk =>
                     {
                         float* localC = (float*)ptrC;
                         int start = chunk * 1024;
@@ -70,7 +71,7 @@ namespace ZeroCompute.Core.Blas
                 }
                 else if (beta != 1.0f)
                 {
-                    Parallel.For(0, (totalElements + 1023) / 1024, chunk =>
+                    Compute.For((totalElements + 1023) / 1024, chunk =>
                     {
                         float* localC = (float*)ptrC;
                         int start = chunk * 1024;
@@ -85,7 +86,7 @@ namespace ZeroCompute.Core.Blas
                 // Tiled blocked GEMM
                 int numBlocksM = (M + BlockSize - 1) / BlockSize;
 
-                Parallel.For(0, numBlocksM, bi =>
+                Compute.For(numBlocksM, bi =>
                 {
                     float* localA = (float*)ptrA;
                     float* localB = (float*)ptrB;
@@ -128,7 +129,7 @@ namespace ZeroCompute.Core.Blas
                             }
                         }
                     }
-                });
+                }, CpuWorkloadType.ComputeBound);
             }
 
             if (!ReferenceEquals(cContig, C))
@@ -137,84 +138,14 @@ namespace ZeroCompute.Core.Blas
             }
         }
 
-        public static unsafe void Add(Tensor<float> A, Tensor<float> B, Tensor<float> C)
+        public static void Add(Tensor<float> A, Tensor<float> B, Tensor<float> C)
         {
-            int total = (int)A.Length;
-            var aContig = A.ToContiguous();
-            var bContig = B.ToContiguous();
-            var cContig = C.ToContiguous();
-
-            var aFlat = aContig.Flatten();
-            var bFlat = bContig.Flatten();
-            var cFlat = cContig.Flatten();
-
-            fixed (float* pA = &aFlat[0])
-            fixed (float* pB = &bFlat[0])
-            fixed (float* pC = &cFlat[0])
-            {
-                IntPtr ptrA = (IntPtr)pA;
-                IntPtr ptrB = (IntPtr)pB;
-                IntPtr ptrC = (IntPtr)pC;
-
-                Parallel.For(0, (total + 2047) / 2048, chunk =>
-                {
-                    float* localA = (float*)ptrA;
-                    float* localB = (float*)ptrB;
-                    float* localC = (float*)ptrC;
-
-                    int start = chunk * 2048;
-                    int end = Math.Min(start + 2048, total);
-                    for (int i = start; i < end; i++)
-                    {
-                        localC[i] = localA[i] + localB[i];
-                    }
-                });
-            }
-
-            if (!ReferenceEquals(cContig, C))
-            {
-                cContig.CopyTo(C);
-            }
+            Compute.Vector.Add(A, B, C);
         }
 
-        public static unsafe void Multiply(Tensor<float> A, Tensor<float> B, Tensor<float> C)
+        public static void Multiply(Tensor<float> A, Tensor<float> B, Tensor<float> C)
         {
-            int total = (int)A.Length;
-            var aContig = A.ToContiguous();
-            var bContig = B.ToContiguous();
-            var cContig = C.ToContiguous();
-
-            var aFlat = aContig.Flatten();
-            var bFlat = bContig.Flatten();
-            var cFlat = cContig.Flatten();
-
-            fixed (float* pA = &aFlat[0])
-            fixed (float* pB = &bFlat[0])
-            fixed (float* pC = &cFlat[0])
-            {
-                IntPtr ptrA = (IntPtr)pA;
-                IntPtr ptrB = (IntPtr)pB;
-                IntPtr ptrC = (IntPtr)pC;
-
-                Parallel.For(0, (total + 2047) / 2048, chunk =>
-                {
-                    float* localA = (float*)ptrA;
-                    float* localB = (float*)ptrB;
-                    float* localC = (float*)ptrC;
-
-                    int start = chunk * 2048;
-                    int end = Math.Min(start + 2048, total);
-                    for (int i = start; i < end; i++)
-                    {
-                        localC[i] = localA[i] * localB[i];
-                    }
-                });
-            }
-
-            if (!ReferenceEquals(cContig, C))
-            {
-                cContig.CopyTo(C);
-            }
+            Compute.Vector.Multiply(A, B, C);
         }
 
         public static unsafe void Activation(Tensor<float> input, Tensor<float> output, ComputeActivationType type)
@@ -235,7 +166,7 @@ namespace ZeroCompute.Core.Blas
                 switch (type)
                 {
                     case ComputeActivationType.ReLU:
-                        Parallel.For(0, (total + 2047) / 2048, chunk =>
+                        Compute.For((total + 2047) / 2048, chunk =>
                         {
                             float* localIn = (float*)ptrIn;
                             float* localOut = (float*)ptrOut;
@@ -250,7 +181,7 @@ namespace ZeroCompute.Core.Blas
                         break;
 
                     case ComputeActivationType.LeakyReLU:
-                        Parallel.For(0, (total + 2047) / 2048, chunk =>
+                        Compute.For((total + 2047) / 2048, chunk =>
                         {
                             float* localIn = (float*)ptrIn;
                             float* localOut = (float*)ptrOut;
@@ -265,7 +196,7 @@ namespace ZeroCompute.Core.Blas
                         break;
 
                     case ComputeActivationType.Sigmoid:
-                        Parallel.For(0, (total + 2047) / 2048, chunk =>
+                        Compute.For((total + 2047) / 2048, chunk =>
                         {
                             float* localIn = (float*)ptrIn;
                             float* localOut = (float*)ptrOut;
@@ -279,7 +210,7 @@ namespace ZeroCompute.Core.Blas
                         break;
 
                     case ComputeActivationType.Tanh:
-                        Parallel.For(0, (total + 2047) / 2048, chunk =>
+                        Compute.For((total + 2047) / 2048, chunk =>
                         {
                             float* localIn = (float*)ptrIn;
                             float* localOut = (float*)ptrOut;
@@ -294,7 +225,7 @@ namespace ZeroCompute.Core.Blas
 
                     case ComputeActivationType.GELU:
                         const float sqrt2OverPi = 0.79788456f;
-                        Parallel.For(0, (total + 2047) / 2048, chunk =>
+                        Compute.For((total + 2047) / 2048, chunk =>
                         {
                             float* localIn = (float*)ptrIn;
                             float* localOut = (float*)ptrOut;
@@ -313,7 +244,7 @@ namespace ZeroCompute.Core.Blas
                         int rows = (int)(input.Length / input.Shape[input.Rank - 1]);
                         int cols = input.Shape[input.Rank - 1];
 
-                        Parallel.For(0, rows, r =>
+                        Compute.For(rows, r =>
                         {
                             float* localIn = (float*)ptrIn;
                             float* localOut = (float*)ptrOut;
@@ -382,7 +313,7 @@ namespace ZeroCompute.Core.Blas
                 IntPtr ptrIn = (IntPtr)pIn;
                 IntPtr ptrOut = (IntPtr)pOut;
 
-                Parallel.For(0, outer, o =>
+                Compute.For(outer, o =>
                 {
                     float* localIn = (float*)ptrIn;
                     float* localOut = (float*)ptrOut;
@@ -440,7 +371,7 @@ namespace ZeroCompute.Core.Blas
                 IntPtr ptrIn = (IntPtr)pIn;
                 IntPtr ptrOut = (IntPtr)pOut;
 
-                Parallel.For(0, outer, o =>
+                Compute.For(outer, o =>
                 {
                     float* localIn = (float*)ptrIn;
                     float* localOut = (float*)ptrOut;
