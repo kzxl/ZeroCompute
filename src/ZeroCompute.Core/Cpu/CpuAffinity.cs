@@ -56,5 +56,80 @@ namespace ZeroCompute.Core.Cpu
                 // Ignored in constrained execution environments
             }
         }
+
+        private static int _physicalCoreCount;
+
+        /// <summary>
+        /// Gets the detected physical CPU core count (excluding SMT / Hyper-Threading logical threads).
+        /// </summary>
+        public static int PhysicalCoreCount
+        {
+            get
+            {
+                if (_physicalCoreCount > 0)
+                    return _physicalCoreCount;
+
+                int count = DetectPhysicalCores();
+                _physicalCoreCount = count > 0 ? count : Math.Max(1, Environment.ProcessorCount / 2);
+                return _physicalCoreCount;
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetLogicalProcessorInformation(IntPtr buffer, ref uint returnedLength);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SYSTEM_LOGICAL_PROCESSOR_INFORMATION
+        {
+            public UIntPtr ProcessorMask;
+            public int Relationship; // 0 = RelationProcessorCore
+            public ulong Dummy1;
+            public ulong Dummy2;
+        }
+
+        private static int DetectPhysicalCores()
+        {
+            if (!IsWindows)
+                return Environment.ProcessorCount;
+
+            try
+            {
+                uint length = 0;
+                GetLogicalProcessorInformation(IntPtr.Zero, ref length);
+                if (length == 0) return 0;
+
+                IntPtr buffer = Marshal.AllocHGlobal((int)length);
+                try
+                {
+                    if (GetLogicalProcessorInformation(buffer, ref length))
+                    {
+                        int structSize = Marshal.SizeOf(typeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+                        int count = (int)(length / structSize);
+                        int physicalCores = 0;
+                        for (int i = 0; i < count; i++)
+                        {
+                            IntPtr ptr = new IntPtr(buffer.ToInt64() + i * structSize);
+                            var info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION)Marshal.PtrToStructure(ptr, typeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION))!;
+                            if (info.Relationship == 0) // RelationProcessorCore
+                            {
+                                physicalCores++;
+                            }
+                        }
+                        if (physicalCores > 0)
+                            return physicalCores;
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+            }
+            catch
+            {
+                // Fallback
+            }
+
+            return Math.Max(1, Environment.ProcessorCount / 2);
+        }
     }
 }

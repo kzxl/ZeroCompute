@@ -211,6 +211,10 @@ namespace ZeroCompute.Core.Cpu
             while (Volatile.Read(ref _remainingWorkers) > 0)
             {
                 spinner.SpinOnce();
+                if (spinner.Count > 10)
+                {
+                    Thread.Yield();
+                }
             }
         }
 

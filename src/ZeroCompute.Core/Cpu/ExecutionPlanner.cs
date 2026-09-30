@@ -108,8 +108,8 @@ namespace ZeroCompute.Core.Cpu
                     break;
 
                 case CpuWorkloadType.ComputeBound:
-                    // Unleash all physical cores
-                    targetWorkers = availableWorkers;
+                    // Allocate physical cores to eliminate SMT/Hyper-Threading FPU contention
+                    targetWorkers = Math.Min(CpuAffinity.PhysicalCoreCount, availableWorkers);
                     break;
 
                 case CpuWorkloadType.Auto:

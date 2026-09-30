@@ -562,6 +562,59 @@ namespace ZeroCompute.Core.Cpu
                     rFlat.CopyTo(result);
                 }
             }
+
+            /// <summary>
+            /// Vectorized high-precision GELU activation using AVX2 SIMD rational approximation.
+            /// </summary>
+            public static unsafe void Gelu(float[] input, float[] output)
+            {
+                if (input == null) throw new ArgumentNullException(nameof(input));
+                if (output == null) throw new ArgumentNullException(nameof(output));
+                if (output.Length < input.Length)
+                    throw new ArgumentException("Output length must match or exceed input length.");
+
+                int count = input.Length;
+                fixed (float* pIn = input)
+                fixed (float* pOut = output)
+                {
+                    float* ptrIn = pIn;
+                    float* ptrOut = pOut;
+
+                    For(count, (start, end) =>
+                    {
+                        ComputeVectorOps.Gelu(ptrIn, ptrOut, start, end);
+                    }, CpuWorkloadType.ComputeBound);
+                }
+            }
+
+            /// <summary>
+            /// Vectorized high-precision GELU activation for Tensors.
+            /// </summary>
+            public static unsafe void Gelu(Tensor<float> input, Tensor<float> output)
+            {
+                if (input == null) throw new ArgumentNullException(nameof(input));
+                if (output == null) throw new ArgumentNullException(nameof(output));
+
+                var inFlat = input.ToContiguous().Flatten();
+                var outFlat = output.ToContiguous().Flatten();
+
+                fixed (float* pIn = &inFlat[0])
+                fixed (float* pOut = &outFlat[0])
+                {
+                    float* ptrIn = pIn;
+                    float* ptrOut = pOut;
+
+                    For(inFlat.Length, (start, end) =>
+                    {
+                        ComputeVectorOps.Gelu(ptrIn, ptrOut, start, end);
+                    }, CpuWorkloadType.ComputeBound);
+                }
+
+                if (!ReferenceEquals(outFlat, output))
+                {
+                    outFlat.CopyTo(output);
+                }
+            }
         }
 
         #endregion

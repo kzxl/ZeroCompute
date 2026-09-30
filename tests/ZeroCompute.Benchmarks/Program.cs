@@ -152,7 +152,7 @@ namespace ZeroCompute.Benchmarks
             sw.Stop();
             double tPar = sw.Elapsed.TotalMilliseconds / iters;
 
-            // 3. Compute.For (ComputeBound worker pool with pinned cores)
+            // 3. Compute.For (ComputeBound worker pool with SMT-mitigated physical cores)
             sw.Restart();
             for (int it = 0; it < iters; it++)
             {
@@ -169,10 +169,21 @@ namespace ZeroCompute.Benchmarks
             sw.Stop();
             double tCompute = sw.Elapsed.TotalMilliseconds / iters;
 
+            // 4. Compute.Vector.Gelu (AVX2 SIMD Vectorized Rational Approximation)
+            float[] outputGelu = new float[N];
+            sw.Restart();
+            for (int it = 0; it < iters; it++)
+            {
+                Compute.Vector.Gelu(input, outputGelu);
+            }
+            sw.Stop();
+            double tGelu = sw.Elapsed.TotalMilliseconds / iters;
+
             Console.WriteLine($"[N = {N:N0} elements - 5 runs averaged]");
-            Console.WriteLine($"  * Sequential       : {tSeq,8:F2} ms (1.00x)");
-            Console.WriteLine($"  * Parallel.For     : {tPar,8:F2} ms ({(tSeq / tPar),5:F2}x)");
-            Console.WriteLine($"  * Compute.For      : {tCompute,8:F2} ms ({(tSeq / tCompute),5:F2}x speedup vs Seq, {(tPar / tCompute),5:F2}x vs Par.For)");
+            Console.WriteLine($"  * Sequential (Scalar) : {tSeq,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * Parallel.For (.NET) : {tPar,8:F2} ms ({(tSeq / tPar),5:F2}x)");
+            Console.WriteLine($"  * Compute.For (Scalar): {tCompute,8:F2} ms ({(tSeq / tCompute),5:F2}x)");
+            Console.WriteLine($"  * Compute.Vector.Gelu : {tGelu,8:F2} ms ({(tSeq / tGelu),5:F2}x speedup vs Seq, {(tPar / tGelu),5:F2}x vs Par.For!)");
             Console.WriteLine();
         }
 

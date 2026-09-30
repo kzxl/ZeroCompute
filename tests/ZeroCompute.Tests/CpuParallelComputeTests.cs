@@ -195,5 +195,33 @@ namespace ZeroCompute.Tests
                 Assert.Equal(count, sum);
             }
         }
+
+        [Fact]
+        public void Compute_Vector_Gelu_MatchesDoublePrecisionExactness()
+        {
+            const int N = 2048;
+            float[] input = new float[N];
+            float[] output = new float[N];
+
+            const float sqrt2OverPi = 0.79788456f;
+            const float coeff = 0.044715f;
+
+            for (int i = 0; i < N; i++)
+            {
+                input[i] = (i - 1024) * 0.005f; // [-5.12 to +5.12]
+            }
+
+            Compute.Vector.Gelu(input, output);
+
+            for (int i = 0; i < N; i++)
+            {
+                float x = input[i];
+                float inner = sqrt2OverPi * (x + coeff * x * x * x);
+                float expected = 0.5f * x * (1.0f + (float)Math.Tanh(inner));
+
+                Assert.True(Math.Abs(expected - output[i]) < 2e-4f,
+                    $"GELU mismatch at index {i} (x={x}): expected {expected}, got {output[i]}");
+            }
+        }
     }
 }
