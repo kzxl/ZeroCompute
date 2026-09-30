@@ -11,7 +11,13 @@ namespace ZeroCompute.Core.Cpu
     /// </summary>
     internal static class CpuAffinity
     {
+#if NETFRAMEWORK
         private static readonly bool IsWindows = Environment.OSVersion.Platform == PlatformID.Win32NT;
+        private static readonly bool IsLinux = Environment.OSVersion.Platform == PlatformID.Unix;
+#else
+        private static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        private static readonly bool IsLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
+#endif
 
         [DllImport("kernel32.dll", ExactSpelling = true)]
         private static extern IntPtr GetCurrentThread();
@@ -19,27 +25,49 @@ namespace ZeroCompute.Core.Cpu
         [DllImport("kernel32.dll", ExactSpelling = true)]
         private static extern UIntPtr SetThreadAffinityMask(IntPtr hThread, UIntPtr dwThreadAffinityMask);
 
+        [DllImport("libc", EntryPoint = "sched_setaffinity", SetLastError = true)]
+        private static extern int sched_setaffinity(int pid, IntPtr cpusetsize, ref ulong mask);
+
         /// <summary>
         /// Pins the calling thread strictly to a specific logical CPU core index.
+        /// Cross-platform support for Windows (SetThreadAffinityMask) and Linux (sched_setaffinity).
         /// </summary>
         /// <param name="coreIndex">Zero-based core index (0 to ProcessorCount - 1).</param>
         /// <returns>True if successfully pinned; false otherwise.</returns>
         public static bool PinCurrentThread(int coreIndex)
         {
-            if (!IsWindows || coreIndex < 0 || coreIndex >= 64)
+            if (coreIndex < 0 || coreIndex >= 64)
                 return false;
 
-            try
+            if (IsWindows)
             {
-                ulong mask = 1UL << (coreIndex % 64);
-                IntPtr hThread = GetCurrentThread();
-                UIntPtr prev = SetThreadAffinityMask(hThread, (UIntPtr)mask);
-                return prev != UIntPtr.Zero;
+                try
+                {
+                    ulong mask = 1UL << (coreIndex % 64);
+                    IntPtr hThread = GetCurrentThread();
+                    UIntPtr prev = SetThreadAffinityMask(hThread, (UIntPtr)mask);
+                    return prev != UIntPtr.Zero;
+                }
+                catch
+                {
+                    return false;
+                }
             }
-            catch
+            else if (IsLinux)
             {
-                return false;
+                try
+                {
+                    ulong mask = 1UL << (coreIndex % 64);
+                    int ret = sched_setaffinity(0, (IntPtr)sizeof(ulong), ref mask);
+                    return ret == 0;
+                }
+                catch
+                {
+                    return false;
+                }
             }
+
+            return false;
         }
 
         /// <summary>
@@ -89,47 +117,108 @@ namespace ZeroCompute.Core.Cpu
 
         private static int DetectPhysicalCores()
         {
-            if (!IsWindows)
-                return Environment.ProcessorCount;
-
-            try
+            if (IsWindows)
             {
-                uint length = 0;
-                GetLogicalProcessorInformation(IntPtr.Zero, ref length);
-                if (length == 0) return 0;
-
-                IntPtr buffer = Marshal.AllocHGlobal((int)length);
                 try
                 {
-                    if (GetLogicalProcessorInformation(buffer, ref length))
+                    uint length = 0;
+                    GetLogicalProcessorInformation(IntPtr.Zero, ref length);
+                    if (length == 0) return 0;
+
+                    IntPtr buffer = Marshal.AllocHGlobal((int)length);
+                    try
                     {
-                        int structSize = Marshal.SizeOf(typeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
-                        int count = (int)(length / structSize);
-                        int physicalCores = 0;
-                        for (int i = 0; i < count; i++)
+                        if (GetLogicalProcessorInformation(buffer, ref length))
                         {
-                            IntPtr ptr = new IntPtr(buffer.ToInt64() + i * structSize);
-                            var info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION)Marshal.PtrToStructure(ptr, typeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION))!;
-                            if (info.Relationship == 0) // RelationProcessorCore
+                            int structSize = Marshal.SizeOf(typeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+                            int count = (int)(length / structSize);
+                            int physicalCores = 0;
+                            for (int i = 0; i < count; i++)
                             {
-                                physicalCores++;
+                                IntPtr ptr = new IntPtr(buffer.ToInt64() + i * structSize);
+                                var info = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION)Marshal.PtrToStructure(ptr, typeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION))!;
+                                if (info.Relationship == 0) // RelationProcessorCore
+                                {
+                                    physicalCores++;
+                                }
                             }
+                            if (physicalCores > 0)
+                                return physicalCores;
                         }
-                        if (physicalCores > 0)
-                            return physicalCores;
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(buffer);
                     }
                 }
-                finally
+                catch
                 {
-                    Marshal.FreeHGlobal(buffer);
+                    // Fallback
                 }
             }
-            catch
+            else if (IsLinux)
             {
-                // Fallback
+                int linuxCores = DetectLinuxPhysicalCores();
+                if (linuxCores > 0)
+                    return linuxCores;
             }
 
             return Math.Max(1, Environment.ProcessorCount / 2);
+        }
+
+        private static int DetectLinuxPhysicalCores()
+        {
+            try
+            {
+                if (!System.IO.File.Exists("/proc/cpuinfo"))
+                    return 0;
+
+                var coreKeys = new System.Collections.Generic.HashSet<string>();
+                string currentPhysicalId = "0";
+                string currentCoreId = "";
+
+                using (var reader = new System.IO.StreamReader("/proc/cpuinfo"))
+                {
+                    string? line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        int colonIdx = line.IndexOf(':');
+                        if (colonIdx > 0)
+                        {
+                            string key = line.Substring(0, colonIdx).Trim();
+                            string val = line.Substring(colonIdx + 1).Trim();
+
+                            if (key.Equals("physical id", StringComparison.OrdinalIgnoreCase))
+                            {
+                                currentPhysicalId = val;
+                            }
+                            else if (key.Equals("core id", StringComparison.OrdinalIgnoreCase))
+                            {
+                                currentCoreId = val;
+                            }
+                        }
+                        else if (string.IsNullOrWhiteSpace(line))
+                        {
+                            if (!string.IsNullOrEmpty(currentCoreId))
+                            {
+                                coreKeys.Add(currentPhysicalId + ":" + currentCoreId);
+                                currentCoreId = "";
+                            }
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(currentCoreId))
+                {
+                    coreKeys.Add(currentPhysicalId + ":" + currentCoreId);
+                }
+
+                return coreKeys.Count > 0 ? coreKeys.Count : 0;
+            }
+            catch
+            {
+                return 0;
+            }
         }
     }
 }
