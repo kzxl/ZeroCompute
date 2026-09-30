@@ -208,17 +208,22 @@ namespace ZeroCompute.Core.Cpu
             if (destination.Length < source.Length)
                 throw new ArgumentException("Destination tensor length is smaller than source tensor length.", nameof(destination));
 
-            var sContig = source.ToContiguous();
-            var dContig = destination.ToContiguous();
+            var sFlat = source.ToContiguous().Flatten();
+            var dFlat = destination.ToContiguous().Flatten();
 
-            int count = sContig.Length;
+            int count = sFlat.Length;
             For(count, (start, end) =>
             {
                 for (int i = start; i < end; i++)
                 {
-                    dContig[i] = mapFunc(sContig[i]);
+                    dFlat[i] = mapFunc(sFlat[i]);
                 }
             }, CpuWorkloadType.Auto);
+
+            if (!ReferenceEquals(dFlat, destination))
+            {
+                dFlat.CopyTo(destination);
+            }
         }
 
         #endregion
