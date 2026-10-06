@@ -13,6 +13,9 @@
     <RepositoryType>git</RepositoryType>
     <PackageOutputPath>$(MSBuildThisFileDirectory)dist\packages</PackageOutputPath>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <ZeroTier>1</ZeroTier>
+    <ZeroTierName>ComputeAndSystem</ZeroTierName>
+    <PackageTags>$(PackageTags);zeroplatform;tier-1;compute;gpu;direct3d11;simd;blas;gemm;numa;flash-attention;quantization</PackageTags>
   </PropertyGroup>
 
   <PropertyGroup Condition="$(MSBuildProjectName.Contains('Tests')) Or $(MSBuildProjectName.Contains('Benchmarks')) Or $(MSBuildProjectName.Contains('Samples'))">
