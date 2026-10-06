@@ -4,6 +4,17 @@ using ZeroTensor.Core;
 namespace ZeroCompute.Core.Cpu
 {
     /// <summary>
+    /// Represents a high-performance element-wise operator capable of being inlined by the JIT into vectorized compute loops.
+    /// </summary>
+    public interface IElementwiseOp<T>
+    {
+        /// <summary>
+        /// Applies the operator transformation to a single element.
+        /// </summary>
+        T Apply(T value);
+    }
+
+    /// <summary>
     /// Sovereign CPU Parallel Compute Runtime API.
     /// Provides CUDA-like parallel abstractions (For, Tile2D, Map, FusedMap, Reduce, Vector)
     /// running exclusively on modern CPUs with automatic core pinning, cache tiling, SIMD unrolling,
@@ -193,6 +204,55 @@ namespace ZeroCompute.Core.Cpu
                     destination[i] = fusedKernel(source[i]);
                 }
             }, CpuWorkloadType.ComputeBound);
+        }
+
+        /// <summary>
+        /// Executes an ultra-high performance fused element-wise kernel on arrays in a single cache pass,
+        /// using a specialized struct operator that eliminates delegate invocation overhead and enables JIT inlining.
+        /// </summary>
+        public static void FusedMap<T, TOp>(T[] source, T[] destination, TOp op)
+            where TOp : struct, IElementwiseOp<T>
+        {
+            if (source == null) throw new ArgumentNullException(nameof(source));
+            if (destination == null) throw new ArgumentNullException(nameof(destination));
+            if (destination.Length < source.Length)
+                throw new ArgumentException("Destination length is smaller than source length.", nameof(destination));
+
+            int count = source.Length;
+            For(count, (start, end) =>
+            {
+                for (int i = start; i < end; i++)
+                {
+                    destination[i] = op.Apply(source[i]);
+                }
+            }, CpuWorkloadType.ComputeBound);
+        }
+
+        /// <summary>
+        /// Executes an ultra-high performance fused element-wise kernel on Spans in a single cache pass,
+        /// using a specialized struct operator that eliminates delegate invocation overhead and enables JIT inlining.
+        /// </summary>
+        public static unsafe void FusedMap<T, TOp>(ReadOnlySpan<T> source, Span<T> destination, TOp op)
+            where T : unmanaged
+            where TOp : struct, IElementwiseOp<T>
+        {
+            if (destination.Length < source.Length)
+                throw new ArgumentException("Destination length is smaller than source length.", nameof(destination));
+
+            int count = source.Length;
+            fixed (T* pSrc = source)
+            fixed (T* pDst = destination)
+            {
+                T* ptrSrc = pSrc;
+                T* ptrDst = pDst;
+                For(count, (start, end) =>
+                {
+                    for (int i = start; i < end; i++)
+                    {
+                        ptrDst[i] = op.Apply(ptrSrc[i]);
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
         }
 
         /// <summary>

@@ -177,6 +177,18 @@ namespace ZeroCompute.Core.Cpu
         }
 
         /// <summary>
+        /// Allocates a safe, disposable NUMA-bound memory buffer implementing <see cref="IDisposable"/>.
+        /// </summary>
+        /// <param name="byteSize">Number of bytes to allocate.</param>
+        /// <param name="preferredNode">Target NUMA node index (0 to NodeCount - 1).</param>
+        /// <returns>A disposable <see cref="NumaBuffer"/> offering safe Span access.</returns>
+        public static NumaBuffer AllocateBuffer(int byteSize, int preferredNode = 0)
+        {
+            IntPtr ptr = Allocate(byteSize, preferredNode);
+            return new NumaBuffer(ptr, byteSize);
+        }
+
+        /// <summary>
         /// Frees a NUMA-allocated unmanaged memory buffer.
         /// </summary>
         public static void Free(IntPtr ptr, int byteSize)
@@ -213,6 +225,62 @@ namespace ZeroCompute.Core.Cpu
             else
             {
                 Marshal.FreeHGlobal(ptr);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Safe, disposable wrapper for a NUMA-allocated contiguous unmanaged memory block.
+    /// Exposes high-performance Spans and pointers with deterministic lifetime management.
+    /// </summary>
+    public sealed class NumaBuffer : IDisposable
+    {
+        private IntPtr _pointer;
+        private readonly int _byteSize;
+        private bool _disposed;
+
+        public IntPtr Pointer => _pointer;
+        public int ByteSize => _byteSize;
+        public bool IsDisposed => _disposed;
+
+        internal NumaBuffer(IntPtr pointer, int byteSize)
+        {
+            _pointer = pointer;
+            _byteSize = byteSize;
+        }
+
+        /// <summary>
+        /// Exposes a writable byte Span over the entire allocated unmanaged buffer.
+        /// </summary>
+        public unsafe Span<byte> AsSpan()
+        {
+            if (_disposed || _pointer == IntPtr.Zero)
+                throw new ObjectDisposedException(nameof(NumaBuffer));
+            return new Span<byte>((void*)_pointer, _byteSize);
+        }
+
+        /// <summary>
+        /// Exposes a typed unmanaged Span over the allocated buffer.
+        /// </summary>
+        public unsafe Span<T> AsSpan<T>() where T : unmanaged
+        {
+            if (_disposed || _pointer == IntPtr.Zero)
+                throw new ObjectDisposedException(nameof(NumaBuffer));
+            int elementSize = sizeof(T);
+            int count = _byteSize / elementSize;
+            return new Span<T>((void*)_pointer, count);
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                if (_pointer != IntPtr.Zero)
+                {
+                    NumaTopology.Free(_pointer, _byteSize);
+                    _pointer = IntPtr.Zero;
+                }
+                _disposed = true;
             }
         }
     }

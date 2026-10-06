@@ -35,6 +35,39 @@ namespace ZeroCompute.Core
             return new ComputeDevice(backend);
         }
 
+        public static bool IsGpuAvailable => Gpu.IsHardwareAccelerated;
+
+        /// <summary>
+        /// Automatically selects Direct3D 11 GPU acceleration if available on the current platform,
+        /// otherwise returns the high-performance CPU parallel compute runtime.
+        /// </summary>
+        public static ComputeDevice GetBestDevice()
+        {
+            var gpuDevice = Gpu;
+            if (gpuDevice.IsHardwareAccelerated)
+            {
+                return new ComputeDevice(ComputeBackend.Direct3D11);
+            }
+            return new ComputeDevice(ComputeBackend.CpuParallel);
+        }
+
+        /// <summary>
+        /// General Matrix Multiplication returning a newly allocated result tensor: C = alpha * (A x B).
+        /// </summary>
+        public Tensor<float> Gemm(Tensor<float> A, Tensor<float> B, float alpha = 1.0f, float beta = 0.0f)
+        {
+            if (A == null) throw new ArgumentNullException(nameof(A));
+            if (B == null) throw new ArgumentNullException(nameof(B));
+            if (A.Rank != 2 || B.Rank != 2)
+                throw new ArgumentException("Tensors must be 2D matrices.");
+            if (A.Shape[1] != B.Shape[0])
+                throw new ArgumentException($"Inner dimensions must match: A is [{A.Shape[0]},{A.Shape[1]}], B is [{B.Shape[0]},{B.Shape[1]}].");
+
+            var C = Tensor.Zeros<float>(A.Shape[0], B.Shape[1]);
+            Gemm(A, B, C, alpha, beta);
+            return C;
+        }
+
         public void Gemm(
             Tensor<float> A,
             Tensor<float> B,

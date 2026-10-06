@@ -27,6 +27,8 @@ namespace ZeroCompute.Benchmarks
             RunBenchmark4_KernelFusion();
             RunBenchmark5_ReductionSum();
             RunBenchmark6_DispatchLatencyMicro();
+            RunBenchmark7_GemmMatrixMultiply();
+            RunBenchmark8_GeluActivation();
 
             Console.WriteLine("\n[DONE] Benchmark suite finished successfully.");
         }
@@ -374,6 +376,109 @@ namespace ZeroCompute.Benchmarks
             Console.WriteLine($"[50,000 iterations of N=100 loop]");
             Console.WriteLine($"  * Parallel.For : {tPar,8:F1} ms total ({tPar / iters * 1000,6:F2} µs/loop)");
             Console.WriteLine($"  * Compute.For  : {tCompute,8:F1} ms total ({tCompute / iters * 1000,6:F2} µs/loop, {(tPar / tCompute),5:F1}x faster via Planner cutoff)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 7: GEMM Matrix Multiplication
+
+        private static void RunBenchmark7_GemmMatrixMultiply()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 7: GEMM Matrix Multiplication (512 x 512 Matrices, Float32)");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            const int M = 512, K = 512, N = 512;
+            float[] a = new float[M * K];
+            float[] b = new float[K * N];
+            float[] cScalar = new float[M * N];
+            float[] cBlas = new float[M * N];
+
+            var rnd = new Random(42);
+            for (int i = 0; i < a.Length; i++) a[i] = (float)rnd.NextDouble();
+            for (int i = 0; i < b.Length; i++) b[i] = (float)rnd.NextDouble();
+
+            // 1. Naive 3-loop scalar GEMM
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < M; i++)
+            {
+                int iK = i * K;
+                int iN = i * N;
+                for (int k = 0; k < K; k++)
+                {
+                    float aVal = a[iK + k];
+                    int kN = k * N;
+                    for (int j = 0; j < N; j++)
+                    {
+                        cScalar[iN + j] += aVal * b[kN + j];
+                    }
+                }
+            }
+            sw.Stop();
+            double tScalar = sw.Elapsed.TotalMilliseconds;
+
+            // 2. BlasEngine Cache-Blocked + Vector<T> SIMD GEMM
+            sw.Restart();
+            ZeroCompute.Core.Blas.BlasEngine.Gemm(a.AsSpan(), b.AsSpan(), cBlas.AsSpan(), M, K, N);
+            sw.Stop();
+            double tBlas = sw.Elapsed.TotalMilliseconds;
+
+            double gflops = (2.0 * M * K * N) / (tBlas * 1e6);
+
+            Console.WriteLine($"[Matrix 512x512 - Single Run]");
+            Console.WriteLine($"  * Naive 3-Loop Scalar : {tScalar,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * BlasEngine SIMD GEMM: {tBlas,8:F2} ms ({(tScalar / tBlas),5:F2}x speedup | {gflops:F2} GFLOPs)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 8: GELU Activation
+
+        private static void RunBenchmark8_GeluActivation()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 8: GELU Activation Function (1,000,000 Elements)");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            const int N = 1_000_000;
+            float[] input = new float[N];
+            float[] outTextbook = new float[N];
+            float[] outSimd = new float[N];
+
+            var rnd = new Random(1337);
+            for (int i = 0; i < N; i++) input[i] = (float)(rnd.NextDouble() * 8.0 - 4.0);
+
+            const int iters = 20;
+
+            // 1. Scalar Math.Tanh textbook
+            float sqrt2OverPi = (float)Math.Sqrt(2.0 / Math.PI);
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                for (int i = 0; i < N; i++)
+                {
+                    float x = input[i];
+                    float inner = sqrt2OverPi * (x + 0.044715f * x * x * x);
+                    outTextbook[i] = 0.5f * x * (1.0f + (float)Math.Tanh(inner));
+                }
+            }
+            sw.Stop();
+            double tScalar = sw.Elapsed.TotalMilliseconds / iters;
+
+            // 2. BlasEngine SIMD Padé rational GELU
+            sw.Restart();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                ZeroCompute.Core.Blas.BlasEngine.Activation(input.AsSpan(), outSimd.AsSpan(), ZeroCompute.Core.Context.ComputeActivationType.GELU);
+            }
+            sw.Stop();
+            double tSimd = sw.Elapsed.TotalMilliseconds / iters;
+
+            Console.WriteLine($"[1,000,000 elements - 20 runs averaged]");
+            Console.WriteLine($"  * Textbook Math.Tanh : {tScalar,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * SIMD Padé Rational : {tSimd,8:F2} ms ({(tScalar / tSimd),5:F2}x speedup)");
             Console.WriteLine();
         }
 

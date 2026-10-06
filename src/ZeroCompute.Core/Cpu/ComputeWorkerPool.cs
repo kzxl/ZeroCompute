@@ -25,6 +25,9 @@ namespace ZeroCompute.Core.Cpu
         private readonly WorkerSlot[] _slots;
         private readonly FastSpinLock _dispatchLock = new FastSpinLock();
 
+        [ThreadStatic]
+        private static bool _isExecutingWorker;
+
         // Job broadcast state
         private int _currentJobId;
         private int _activeWorkers;
@@ -83,6 +86,13 @@ namespace ZeroCompute.Core.Cpu
             if (rangeAction == null)
                 throw new ArgumentNullException(nameof(rangeAction));
 
+            if (_isExecutingWorker)
+            {
+                // Reentrant / nested parallel dispatch fallback to inline execution to avoid deadlock
+                rangeAction(0, totalCount);
+                return;
+            }
+
             int activeWorkers = Math.Min(Math.Min(maxWorkers, _workerCount), totalCount);
             if (activeWorkers <= 1)
             {
@@ -95,32 +105,40 @@ namespace ZeroCompute.Core.Cpu
 
             using (_dispatchLock.EnterScope())
             {
-                _dispatchException = null;
-                _totalCount = totalCount;
-                _chunkSize = targetChunk;
-                _currentChunkOffset = 0;
-                _activeWorkers = activeWorkers;
-                _currentAction = rangeAction;
-                _currentIndexedAction = null;
-                _remainingWorkers = activeWorkers - 1;
-
-                int nextJob = _currentJobId + 1;
-                if (nextJob == 0) nextJob = 1;
-                Volatile.Write(ref _currentJobId, nextJob);
-
-                for (int w = 1; w < activeWorkers; w++)
+                _isExecutingWorker = true;
+                try
                 {
-                    _slots[w].Wake.Set();
+                    _dispatchException = null;
+                    _totalCount = totalCount;
+                    _chunkSize = targetChunk;
+                    _currentChunkOffset = 0;
+                    _activeWorkers = activeWorkers;
+                    _currentAction = rangeAction;
+                    _currentIndexedAction = null;
+                    _remainingWorkers = activeWorkers - 1;
+
+                    int nextJob = _currentJobId + 1;
+                    if (nextJob == 0) nextJob = 1;
+                    Volatile.Write(ref _currentJobId, nextJob);
+
+                    for (int w = 1; w < activeWorkers; w++)
+                    {
+                        _slots[w].Wake.Set();
+                    }
+
+                    // Coordinator participates in dynamic chunk execution
+                    ExecuteWorkerChunks(rangeAction);
+
+                    WaitForCompletion();
+
+                    if (_dispatchException != null)
+                    {
+                        throw new AggregateException("An exception occurred during parallel compute execution.", _dispatchException);
+                    }
                 }
-
-                // Coordinator participates in dynamic chunk execution
-                ExecuteWorkerChunks(rangeAction);
-
-                WaitForCompletion();
-
-                if (_dispatchException != null)
+                finally
                 {
-                    throw new AggregateException("An exception occurred during parallel compute execution.", _dispatchException);
+                    _isExecutingWorker = false;
                 }
             }
         }
@@ -135,6 +153,12 @@ namespace ZeroCompute.Core.Cpu
             if (rangeAction == null)
                 throw new ArgumentNullException(nameof(rangeAction));
 
+            if (_isExecutingWorker)
+            {
+                rangeAction(0, totalCount, 0);
+                return;
+            }
+
             int activeWorkers = Math.Min(Math.Min(maxWorkers, _workerCount), totalCount);
             if (activeWorkers <= 1)
             {
@@ -146,38 +170,46 @@ namespace ZeroCompute.Core.Cpu
 
             using (_dispatchLock.EnterScope())
             {
-                _dispatchException = null;
-                _totalCount = totalCount;
-                _chunkSize = chunkSize;
-                _activeWorkers = activeWorkers;
-                _currentAction = null;
-                _currentIndexedAction = rangeAction;
-                _remainingWorkers = activeWorkers - 1;
-
-                int nextJob = _currentJobId + 1;
-                if (nextJob == 0) nextJob = 1;
-                Volatile.Write(ref _currentJobId, nextJob);
-
-                for (int w = 1; w < activeWorkers; w++)
-                {
-                    _slots[w].Wake.Set();
-                }
-
-                int coordEnd = Math.Min(chunkSize, totalCount);
+                _isExecutingWorker = true;
                 try
                 {
-                    rangeAction(0, coordEnd, 0);
-                }
-                catch (Exception ex)
-                {
-                    _dispatchException = ex;
-                }
+                    _dispatchException = null;
+                    _totalCount = totalCount;
+                    _chunkSize = chunkSize;
+                    _activeWorkers = activeWorkers;
+                    _currentAction = null;
+                    _currentIndexedAction = rangeAction;
+                    _remainingWorkers = activeWorkers - 1;
 
-                WaitForCompletion();
+                    int nextJob = _currentJobId + 1;
+                    if (nextJob == 0) nextJob = 1;
+                    Volatile.Write(ref _currentJobId, nextJob);
 
-                if (_dispatchException != null)
+                    for (int w = 1; w < activeWorkers; w++)
+                    {
+                        _slots[w].Wake.Set();
+                    }
+
+                    int coordEnd = Math.Min(chunkSize, totalCount);
+                    try
+                    {
+                        rangeAction(0, coordEnd, 0);
+                    }
+                    catch (Exception ex)
+                    {
+                        _dispatchException = ex;
+                    }
+
+                    WaitForCompletion();
+
+                    if (_dispatchException != null)
+                    {
+                        throw new AggregateException("An exception occurred during parallel compute execution.", _dispatchException);
+                    }
+                }
+                finally
                 {
-                    throw new AggregateException("An exception occurred during parallel compute execution.", _dispatchException);
+                    _isExecutingWorker = false;
                 }
             }
         }
@@ -211,15 +243,23 @@ namespace ZeroCompute.Core.Cpu
             while (Volatile.Read(ref _remainingWorkers) > 0)
             {
                 spinner.SpinOnce();
-                if (spinner.Count > 10)
+                if (spinner.Count > 20)
                 {
                     Thread.Yield();
+                }
+                else if (spinner.Count > 100)
+                {
+                    Thread.Sleep(0);
                 }
             }
         }
 
         private void WorkerLoop(WorkerSlot slot)
         {
+            // Pin worker strictly to designated core and set high scheduling priority
+            CpuAffinity.PinCurrentThread(slot.WorkerIndex);
+            CpuAffinity.SetHighPriority();
+
             while (!_isDisposed)
             {
                 slot.Wake.WaitOne();
@@ -229,28 +269,36 @@ namespace ZeroCompute.Core.Cpu
                 int workerIndex = slot.WorkerIndex;
                 if (workerIndex < _activeWorkers)
                 {
-                    var action = _currentAction;
-                    var idxAction = _currentIndexedAction;
+                    _isExecutingWorker = true;
+                    try
+                    {
+                        var action = _currentAction;
+                        var idxAction = _currentIndexedAction;
 
-                    if (action != null)
-                    {
-                        ExecuteWorkerChunks(action);
-                    }
-                    else if (idxAction != null)
-                    {
-                        int start = workerIndex * _chunkSize;
-                        int end = Math.Min(start + _chunkSize, _totalCount);
-                        if (start < end)
+                        if (action != null)
                         {
-                            try
+                            ExecuteWorkerChunks(action);
+                        }
+                        else if (idxAction != null)
+                        {
+                            int start = workerIndex * _chunkSize;
+                            int end = Math.Min(start + _chunkSize, _totalCount);
+                            if (start < end)
                             {
-                                idxAction(start, end, workerIndex);
-                            }
-                            catch (Exception ex)
-                            {
-                                _dispatchException = ex;
+                                try
+                                {
+                                    idxAction(start, end, workerIndex);
+                                }
+                                catch (Exception ex)
+                                {
+                                    _dispatchException = ex;
+                                }
                             }
                         }
+                    }
+                    finally
+                    {
+                        _isExecutingWorker = false;
                     }
 
                     Interlocked.Decrement(ref _remainingWorkers);

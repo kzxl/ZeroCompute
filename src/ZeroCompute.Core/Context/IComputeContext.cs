@@ -22,6 +22,11 @@ namespace ZeroCompute.Core.Context
             float beta = 0.0f);
 
         /// <summary>
+        /// General Matrix Multiplication returning a newly allocated result tensor: C = alpha * (A x B).
+        /// </summary>
+        Tensor<float> Gemm(Tensor<float> A, Tensor<float> B, float alpha = 1.0f, float beta = 0.0f);
+
+        /// <summary>
         /// Element-wise addition: C = A + B.
         /// </summary>
         void Add(Tensor<float> A, Tensor<float> B, Tensor<float> C);

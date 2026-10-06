@@ -196,14 +196,14 @@ namespace ZeroCompute.Core.DirectX
             Marshal.GetDelegateForFunctionPointer<UnmapDelegate>(methodPtr)(context, resource, subresource);
         }
 
-        // ID3D11DeviceContext::Dispatch (Slot 42)
+        // ID3D11DeviceContext::Dispatch (Slot 41)
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate void DispatchDelegate(IntPtr thisPtr, uint threadGroupCountX, uint threadGroupCountY, uint threadGroupCountZ);
 
         public static void Dispatch(IntPtr context, uint x, uint y, uint z)
         {
             if (context == IntPtr.Zero) return;
-            IntPtr methodPtr = (*(IntPtr**)context)[42];
+            IntPtr methodPtr = (*(IntPtr**)context)[41];
             Marshal.GetDelegateForFunctionPointer<DispatchDelegate>(methodPtr)(context, x, y, z);
         }
 
@@ -218,7 +218,7 @@ namespace ZeroCompute.Core.DirectX
             Marshal.GetDelegateForFunctionPointer<CopyResourceDelegate>(methodPtr)(context, dst, src);
         }
 
-        // ID3D11DeviceContext::UpdateSubresource (Slot 49)
+        // ID3D11DeviceContext::UpdateSubresource (Slot 48)
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate void UpdateSubresourceDelegate(IntPtr thisPtr, IntPtr pDstResource, uint dstSubresource, IntPtr pDstBox, IntPtr pSrcData, uint srcRowPitch, uint srcDepthPitch);
 
@@ -229,31 +229,7 @@ namespace ZeroCompute.Core.DirectX
             Marshal.GetDelegateForFunctionPointer<UpdateSubresourceDelegate>(methodPtr)(context, dst, 0, IntPtr.Zero, srcData, 0, 0);
         }
 
-        // ID3D11DeviceContext::CSSetShader (Slot 66)
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate void CSSetShaderDelegate(IntPtr thisPtr, IntPtr pComputeShader, IntPtr* ppClassInstances, uint numClassInstances);
-
-        public static void CSSetShader(IntPtr context, IntPtr computeShader)
-        {
-            if (context == IntPtr.Zero) return;
-            IntPtr methodPtr = (*(IntPtr**)context)[66];
-            Marshal.GetDelegateForFunctionPointer<CSSetShaderDelegate>(methodPtr)(context, computeShader, null, 0);
-        }
-
-        // ID3D11DeviceContext::CSSetConstantBuffers (Slot 67)
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate void CSSetConstantBuffersDelegate(IntPtr thisPtr, uint startSlot, uint numBuffers, IntPtr* ppConstantBuffers);
-
-        public static void CSSetConstantBuffers(IntPtr context, uint startSlot, IntPtr buffer)
-        {
-            if (context == IntPtr.Zero) return;
-            IntPtr* ptr = stackalloc IntPtr[1];
-            ptr[0] = buffer;
-            IntPtr methodPtr = (*(IntPtr**)context)[67];
-            Marshal.GetDelegateForFunctionPointer<CSSetConstantBuffersDelegate>(methodPtr)(context, startSlot, 1, ptr);
-        }
-
-        // ID3D11DeviceContext::CSSetShaderResources (Slot 68)
+        // ID3D11DeviceContext::CSSetShaderResources (Slot 67)
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate void CSSetShaderResourcesDelegate(IntPtr thisPtr, uint startSlot, uint numViews, IntPtr* ppShaderResourceViews);
 
@@ -262,12 +238,12 @@ namespace ZeroCompute.Core.DirectX
             if (context == IntPtr.Zero || srvs == null || srvs.Length == 0) return;
             fixed (IntPtr* ptr = srvs)
             {
-                IntPtr methodPtr = (*(IntPtr**)context)[68];
+                IntPtr methodPtr = (*(IntPtr**)context)[67];
                 Marshal.GetDelegateForFunctionPointer<CSSetShaderResourcesDelegate>(methodPtr)(context, startSlot, (uint)srvs.Length, ptr);
             }
         }
 
-        // ID3D11DeviceContext::CSSetUnorderedAccessViews (Slot 69)
+        // ID3D11DeviceContext::CSSetUnorderedAccessViews (Slot 68)
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate void CSSetUnorderedAccessViewsDelegate(IntPtr thisPtr, uint startSlot, uint numUAVs, IntPtr* ppUnorderedAccessViews, uint* pUAVInitialCounts);
 
@@ -279,9 +255,33 @@ namespace ZeroCompute.Core.DirectX
                 uint* counts = stackalloc uint[uavs.Length];
                 for (int i = 0; i < uavs.Length; i++) counts[i] = unchecked((uint)-1);
 
-                IntPtr methodPtr = (*(IntPtr**)context)[69];
+                IntPtr methodPtr = (*(IntPtr**)context)[68];
                 Marshal.GetDelegateForFunctionPointer<CSSetUnorderedAccessViewsDelegate>(methodPtr)(context, startSlot, (uint)uavs.Length, ptr, counts);
             }
+        }
+
+        // ID3D11DeviceContext::CSSetShader (Slot 69)
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void CSSetShaderDelegate(IntPtr thisPtr, IntPtr pComputeShader, IntPtr* ppClassInstances, uint numClassInstances);
+
+        public static void CSSetShader(IntPtr context, IntPtr computeShader)
+        {
+            if (context == IntPtr.Zero) return;
+            IntPtr methodPtr = (*(IntPtr**)context)[69];
+            Marshal.GetDelegateForFunctionPointer<CSSetShaderDelegate>(methodPtr)(context, computeShader, null, 0);
+        }
+
+        // ID3D11DeviceContext::CSSetConstantBuffers (Slot 71)
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        private delegate void CSSetConstantBuffersDelegate(IntPtr thisPtr, uint startSlot, uint numBuffers, IntPtr* ppConstantBuffers);
+
+        public static void CSSetConstantBuffers(IntPtr context, uint startSlot, IntPtr buffer)
+        {
+            if (context == IntPtr.Zero) return;
+            IntPtr* ptr = stackalloc IntPtr[1];
+            ptr[0] = buffer;
+            IntPtr methodPtr = (*(IntPtr**)context)[71];
+            Marshal.GetDelegateForFunctionPointer<CSSetConstantBuffersDelegate>(methodPtr)(context, startSlot, 1, ptr);
         }
     }
 }
