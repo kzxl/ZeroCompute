@@ -27,6 +27,16 @@ namespace ZeroCompute.Core.Context
         Tensor<float> Gemm(Tensor<float> A, Tensor<float> B, float alpha = 1.0f, float beta = 0.0f);
 
         /// <summary>
+        /// Batched General Matrix Multiplication: C[b] = alpha * (A[b] x B[b]) + beta * C[b].
+        /// </summary>
+        void BatchedGemm(
+            Tensor<float> A,
+            Tensor<float> B,
+            Tensor<float> C,
+            float alpha = 1.0f,
+            float beta = 0.0f);
+
+        /// <summary>
         /// Element-wise addition: C = A + B.
         /// </summary>
         void Add(Tensor<float> A, Tensor<float> B, Tensor<float> C);
@@ -42,7 +52,22 @@ namespace ZeroCompute.Core.Context
         void Activation(Tensor<float> input, Tensor<float> output, ComputeActivationType type);
 
         /// <summary>
-        /// Reduces tensor along the specified axis (e.g., sum, max, mean).
+        /// Root Mean Square Normalization (RMSNorm).
+        /// </summary>
+        void RmsNorm(Tensor<float> input, Tensor<float> output, Tensor<float>? weight = null, float epsilon = 1e-5f);
+
+        /// <summary>
+        /// Layer Normalization (LayerNorm).
+        /// </summary>
+        void LayerNorm(Tensor<float> input, Tensor<float> output, Tensor<float>? weight = null, Tensor<float>? bias = null, float epsilon = 1e-5f);
+
+        /// <summary>
+        /// Numerically stable row-wise Softmax over specified axis.
+        /// </summary>
+        void Softmax(Tensor<float> input, Tensor<float> output, int axis = -1);
+
+        /// <summary>
+        /// Reduces tensor along the specified axis (e.g., sum, max).
         /// </summary>
         Tensor<float> ReduceSum(Tensor<float> input, int axis);
         Tensor<float> ReduceMax(Tensor<float> input, int axis);

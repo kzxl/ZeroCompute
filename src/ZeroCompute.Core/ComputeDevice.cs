@@ -7,6 +7,7 @@ namespace ZeroCompute.Core
 {
     /// <summary>
     /// Factory and coordinator for high-performance hardware and CPU compute dispatch.
+    /// Provides transparent execution across CPU thread pools and Direct3D 11 GPU compute shaders.
     /// </summary>
     public sealed class ComputeDevice : IComputeContext
     {
@@ -20,6 +21,7 @@ namespace ZeroCompute.Core
 
         public ComputeBackend Backend { get; }
         public bool IsHardwareAccelerated => _d3d11Context?.IsHardwareAccelerated ?? false;
+        public ZeroCompute.Core.DirectX.D3D11ComputeContext? D3D11Context => _d3d11Context;
 
         public ComputeDevice(ComputeBackend backend = ComputeBackend.CpuParallel)
         {
@@ -52,6 +54,30 @@ namespace ZeroCompute.Core
         }
 
         /// <summary>
+        /// Allocates a GPU VRAM-resident tensor if running on Direct3D 11, otherwise allocates a host CPU tensor.
+        /// </summary>
+        public Tensor<T> AllocateDeviceTensor<T>(TensorShape shape) where T : unmanaged, IEquatable<T>
+        {
+            if (_d3d11Context != null && _d3d11Context.IsHardwareAccelerated)
+            {
+                return _d3d11Context.AllocateDeviceTensor<T>(shape);
+            }
+            return new Tensor<T>(shape);
+        }
+
+        /// <summary>
+        /// Moves a host tensor to GPU VRAM if running on Direct3D 11, returning a device-resident tensor.
+        /// </summary>
+        public Tensor<T> ToDevice<T>(Tensor<T> hostTensor) where T : unmanaged, IEquatable<T>
+        {
+            if (_d3d11Context != null && _d3d11Context.IsHardwareAccelerated)
+            {
+                return _d3d11Context.ToDevice(hostTensor);
+            }
+            return hostTensor;
+        }
+
+        /// <summary>
         /// General Matrix Multiplication returning a newly allocated result tensor: C = alpha * (A x B).
         /// </summary>
         public Tensor<float> Gemm(Tensor<float> A, Tensor<float> B, float alpha = 1.0f, float beta = 0.0f)
@@ -81,6 +107,19 @@ namespace ZeroCompute.Core
                 BlasEngine.Gemm(A, B, C, alpha, beta);
         }
 
+        public void BatchedGemm(
+            Tensor<float> A,
+            Tensor<float> B,
+            Tensor<float> C,
+            float alpha = 1.0f,
+            float beta = 0.0f)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.BatchedGemm(A, B, C, alpha, beta);
+            else
+                BlasEngine.BatchedGemm(A, B, C, alpha, beta);
+        }
+
         public void Add(Tensor<float> A, Tensor<float> B, Tensor<float> C)
         {
             if (_d3d11Context != null)
@@ -103,6 +142,30 @@ namespace ZeroCompute.Core
                 _d3d11Context.Activation(input, output, type);
             else
                 BlasEngine.Activation(input, output, type);
+        }
+
+        public void RmsNorm(Tensor<float> input, Tensor<float> output, Tensor<float>? weight = null, float epsilon = 1e-5f)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.RmsNorm(input, output, weight, epsilon);
+            else
+                BlasEngine.RmsNorm(input, output, weight, epsilon);
+        }
+
+        public void LayerNorm(Tensor<float> input, Tensor<float> output, Tensor<float>? weight = null, Tensor<float>? bias = null, float epsilon = 1e-5f)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.LayerNorm(input, output, weight, bias, epsilon);
+            else
+                BlasEngine.LayerNorm(input, output, weight, bias, epsilon);
+        }
+
+        public void Softmax(Tensor<float> input, Tensor<float> output, int axis = -1)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.Softmax(input, output, axis);
+            else
+                BlasEngine.Softmax(input, output, axis);
         }
 
         public Tensor<float> ReduceSum(Tensor<float> input, int axis)

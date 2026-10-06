@@ -1,6 +1,10 @@
 using System;
 using System.Numerics;
 using System.Threading.Tasks;
+#if NET8_0_OR_GREATER
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+#endif
 using ZeroCompute.Core.Context;
 using ZeroCompute.Core.Cpu;
 using ZeroTensor.Core;
@@ -132,6 +136,14 @@ namespace ZeroCompute.Core.Blas
                 });
             }
 
+#if NET8_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported)
+            {
+                ExecuteGemmAvx2Fma(ptrA, ptrB, ptrC, M, K, N, alpha);
+                return;
+            }
+#endif
+
             // Tiled blocked GEMM with SIMD FMA unrolling
             int numBlocksM = (M + BlockSize - 1) / BlockSize;
             int vStep = Vector<float>.Count;
@@ -203,6 +215,118 @@ namespace ZeroCompute.Core.Blas
                 }
             }, CpuWorkloadType.ComputeBound);
         }
+
+#if NET8_0_OR_GREATER
+        private static unsafe void ExecuteGemmAvx2Fma(
+            IntPtr ptrA, IntPtr ptrB, IntPtr ptrC,
+            int M, int K, int N,
+            float alpha)
+        {
+            int numBlocksM = (M + BlockSize - 1) / BlockSize;
+
+            Compute.For(numBlocksM, bi =>
+            {
+                float* localA = (float*)ptrA;
+                float* localB = (float*)ptrB;
+                float* localC = (float*)ptrC;
+
+                int iStart = bi * BlockSize;
+                int iEnd = Math.Min(iStart + BlockSize, M);
+
+                for (int bk = 0; bk < K; bk += BlockSize)
+                {
+                    int kEnd = Math.Min(bk + BlockSize, K);
+
+                    for (int bj = 0; bj < N; bj += BlockSize)
+                    {
+                        int jEnd = Math.Min(bj + BlockSize, N);
+
+                        // 4x8 microkernel: 4 rows x 8 cols (1 Vector256 per row)
+                        int i = iStart;
+                        for (; i <= iEnd - 4; i += 4)
+                        {
+                            float* pC0 = localC + (i + 0) * N;
+                            float* pC1 = localC + (i + 1) * N;
+                            float* pC2 = localC + (i + 2) * N;
+                            float* pC3 = localC + (i + 3) * N;
+
+                            int j = bj;
+                            for (; j <= jEnd - 8; j += 8)
+                            {
+                                var c0 = Avx.LoadVector256(pC0 + j);
+                                var c1 = Avx.LoadVector256(pC1 + j);
+                                var c2 = Avx.LoadVector256(pC2 + j);
+                                var c3 = Avx.LoadVector256(pC3 + j);
+
+                                for (int k = bk; k < kEnd; k++)
+                                {
+                                    var vb = Avx.LoadVector256(localB + k * N + j);
+
+                                    var va0 = Vector256.Create(alpha * localA[(i + 0) * K + k]);
+                                    var va1 = Vector256.Create(alpha * localA[(i + 1) * K + k]);
+                                    var va2 = Vector256.Create(alpha * localA[(i + 2) * K + k]);
+                                    var va3 = Vector256.Create(alpha * localA[(i + 3) * K + k]);
+
+                                    c0 = Fma.MultiplyAdd(va0, vb, c0);
+                                    c1 = Fma.MultiplyAdd(va1, vb, c1);
+                                    c2 = Fma.MultiplyAdd(va2, vb, c2);
+                                    c3 = Fma.MultiplyAdd(va3, vb, c3);
+                                }
+
+                                Avx.Store(pC0 + j, c0);
+                                Avx.Store(pC1 + j, c1);
+                                Avx.Store(pC2 + j, c2);
+                                Avx.Store(pC3 + j, c3);
+                            }
+
+                            // Cleanup remaining columns for these 4 rows
+                            for (int k = bk; k < kEnd; k++)
+                            {
+                                float a0 = alpha * localA[(i + 0) * K + k];
+                                float a1 = alpha * localA[(i + 1) * K + k];
+                                float a2 = alpha * localA[(i + 2) * K + k];
+                                float a3 = alpha * localA[(i + 3) * K + k];
+                                float* pB = localB + k * N;
+
+                                for (int cj = j; cj < jEnd; cj++)
+                                {
+                                    float bVal = pB[cj];
+                                    pC0[cj] += a0 * bVal;
+                                    pC1[cj] += a1 * bVal;
+                                    pC2[cj] += a2 * bVal;
+                                    pC3[cj] += a3 * bVal;
+                                }
+                            }
+                        }
+
+                        // Cleanup remaining rows
+                        for (; i < iEnd; i++)
+                        {
+                            float* pRowC = localC + i * N;
+                            for (int k = bk; k < kEnd; k++)
+                            {
+                                float aVal = alpha * localA[i * K + k];
+                                float* pRowB = localB + k * N;
+                                var va = Vector256.Create(aVal);
+
+                                int j = bj;
+                                for (; j <= jEnd - 8; j += 8)
+                                {
+                                    var vc = Avx.LoadVector256(pRowC + j);
+                                    var vb = Avx.LoadVector256(pRowB + j);
+                                    Avx.Store(pRowC + j, Fma.MultiplyAdd(va, vb, vc));
+                                }
+                                for (; j < jEnd; j++)
+                                {
+                                    pRowC[j] += aVal * pRowB[j];
+                                }
+                            }
+                        }
+                    }
+                }
+            }, CpuWorkloadType.ComputeBound);
+        }
+#endif
 
         public static void Add(Tensor<float> A, Tensor<float> B, Tensor<float> C)
         {
@@ -505,6 +629,347 @@ namespace ZeroCompute.Core.Blas
             }
 
             return output;
+        }
+
+        /// <summary>
+        /// Batched General Matrix Multiplication: C[b] = alpha * (A[b] x B[b]) + beta * C[b].
+        /// Supports rank 3 tensors [B, M, K] x [B, K, N] and rank 4 tensors [B, H, M, K] x [B, H, K, N].
+        /// </summary>
+        public static unsafe void BatchedGemm(
+            Tensor<float> A, Tensor<float> B, Tensor<float> C,
+            float alpha = 1.0f, float beta = 0.0f)
+        {
+            if (A == null) throw new ArgumentNullException(nameof(A));
+            if (B == null) throw new ArgumentNullException(nameof(B));
+            if (C == null) throw new ArgumentNullException(nameof(C));
+
+            if (A.Rank < 3 || B.Rank < 3)
+                throw new ArgumentException("Batched GEMM requires tensors with rank >= 3.");
+
+            int rank = A.Rank;
+            int M = A.Shape[rank - 2];
+            int K = A.Shape[rank - 1];
+            int N = B.Shape[rank - 1];
+
+            if (B.Shape[rank - 2] != K)
+                throw new ArgumentException($"Inner dimensions must match: A is [..., {M}, {K}], B is [..., {B.Shape[rank - 2]}, {N}].");
+
+            int batchCount = 1;
+            for (int d = 0; d < rank - 2; d++)
+            {
+                if (A.Shape[d] != B.Shape[d])
+                    throw new ArgumentException($"Batch dimension {d} mismatch: A has {A.Shape[d]}, B has {B.Shape[d]}.");
+                batchCount *= A.Shape[d];
+            }
+
+            var aContig = A.ToContiguous();
+            var bContig = B.ToContiguous();
+            var cContig = C.ToContiguous();
+
+            int strideA = M * K;
+            int strideB = K * N;
+            int strideC = M * N;
+
+            fixed (float* pA = aContig.AsSpan())
+            fixed (float* pB = bContig.AsSpan())
+            fixed (float* pC = cContig.AsSpan())
+            {
+                IntPtr ptrA = (IntPtr)pA;
+                IntPtr ptrB = (IntPtr)pB;
+                IntPtr ptrC = (IntPtr)pC;
+
+                ComputeWorkerPool.Shared.DispatchRange(batchCount, Environment.ProcessorCount, (startBatch, countBatch) =>
+                {
+                    for (int b = startBatch; b < startBatch + countBatch; b++)
+                    {
+                        float* curA = (float*)ptrA + b * strideA;
+                        float* curB = (float*)ptrB + b * strideB;
+                        float* curC = (float*)ptrC + b * strideC;
+                        Gemm(new ReadOnlySpan<float>(curA, strideA),
+                             new ReadOnlySpan<float>(curB, strideB),
+                             new Span<float>(curC, strideC),
+                             M, K, N, alpha, beta);
+                    }
+                });
+            }
+
+            if (!ReferenceEquals(cContig, C))
+            {
+                cContig.CopyTo(C);
+            }
+        }
+
+        /// <summary>
+        /// Root Mean Square Normalization (RMSNorm) widely utilized in modern LLM architectures (LLaMA, Mistral, Qwen).
+        /// </summary>
+        public static unsafe void RmsNorm(
+            Tensor<float> input, Tensor<float> output,
+            Tensor<float>? weight = null, float epsilon = 1e-5f)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and Output tensor lengths must match.");
+
+            int rank = input.Rank;
+            int hiddenDim = input.Shape[rank - 1];
+            int rowCount = input.Length / hiddenDim;
+
+            var inContig = input.ToContiguous();
+            var outContig = output.ToContiguous();
+            var wContig = weight != null ? weight.ToContiguous() : null;
+
+            int vStep = Vector<float>.Count;
+
+            fixed (float* pIn = inContig.AsSpan())
+            fixed (float* pOut = outContig.AsSpan())
+            fixed (float* pW = (wContig != null ? wContig.AsSpan() : ReadOnlySpan<float>.Empty))
+            {
+                IntPtr ptrIn = (IntPtr)pIn;
+                IntPtr ptrOut = (IntPtr)pOut;
+                IntPtr ptrW = (IntPtr)pW;
+                bool hasWeight = ptrW != IntPtr.Zero;
+
+                Compute.For(rowCount, row =>
+                {
+                    float* inRow = (float*)ptrIn + row * hiddenDim;
+                    float* outRow = (float*)ptrOut + row * hiddenDim;
+                    float* wRow = (float*)ptrW;
+
+                    float sumSq = 0.0f;
+                    int i = 0;
+
+                    if (Vector.IsHardwareAccelerated && hiddenDim >= vStep)
+                    {
+                        var vSum = Vector<float>.Zero;
+                        int vLimit = (hiddenDim / vStep) * vStep;
+                        for (; i < vLimit; i += vStep)
+                        {
+                            var v = *(Vector<float>*)(inRow + i);
+                            vSum += v * v;
+                        }
+                        for (int e = 0; e < vStep; e++) sumSq += vSum[e];
+                    }
+
+                    for (; i < hiddenDim; i++)
+                    {
+                        float v = inRow[i];
+                        sumSq += v * v;
+                    }
+
+                    float invRms = 1.0f / (float)Math.Sqrt((sumSq / hiddenDim) + epsilon);
+
+                    int j = 0;
+                    if (Vector.IsHardwareAccelerated && hiddenDim >= vStep)
+                    {
+                        var vInv = new Vector<float>(invRms);
+                        int vLimit = (hiddenDim / vStep) * vStep;
+                        if (hasWeight)
+                        {
+                            for (; j < vLimit; j += vStep)
+                            {
+                                var vX = *(Vector<float>*)(inRow + j);
+                                var vW = *(Vector<float>*)(wRow + j);
+                                *(Vector<float>*)(outRow + j) = vX * vInv * vW;
+                            }
+                        }
+                        else
+                        {
+                            for (; j < vLimit; j += vStep)
+                            {
+                                var vX = *(Vector<float>*)(inRow + j);
+                                *(Vector<float>*)(outRow + j) = vX * vInv;
+                            }
+                        }
+                    }
+
+                    for (; j < hiddenDim; j++)
+                    {
+                        float w = hasWeight ? wRow[j] : 1.0f;
+                        outRow[j] = inRow[j] * invRms * w;
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
+
+            if (!ReferenceEquals(outContig, output))
+            {
+                outContig.CopyTo(output);
+            }
+        }
+
+        /// <summary>
+        /// Layer Normalization (LayerNorm) standard in transformer attention and feed-forward blocks.
+        /// </summary>
+        public static unsafe void LayerNorm(
+            Tensor<float> input, Tensor<float> output,
+            Tensor<float>? weight = null, Tensor<float>? bias = null, float epsilon = 1e-5f)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and Output tensor lengths must match.");
+
+            int rank = input.Rank;
+            int hiddenDim = input.Shape[rank - 1];
+            int rowCount = input.Length / hiddenDim;
+
+            var inContig = input.ToContiguous();
+            var outContig = output.ToContiguous();
+            var wContig = weight != null ? weight.ToContiguous() : null;
+            var bContig = bias != null ? bias.ToContiguous() : null;
+
+            int vStep = Vector<float>.Count;
+
+            fixed (float* pIn = inContig.AsSpan())
+            fixed (float* pOut = outContig.AsSpan())
+            fixed (float* pW = (wContig != null ? wContig.AsSpan() : ReadOnlySpan<float>.Empty))
+            fixed (float* pB = (bContig != null ? bContig.AsSpan() : ReadOnlySpan<float>.Empty))
+            {
+                IntPtr ptrIn = (IntPtr)pIn;
+                IntPtr ptrOut = (IntPtr)pOut;
+                IntPtr ptrW = (IntPtr)pW;
+                IntPtr ptrB = (IntPtr)pB;
+
+                bool hasWeight = ptrW != IntPtr.Zero;
+                bool hasBias = ptrB != IntPtr.Zero;
+
+                Compute.For(rowCount, row =>
+                {
+                    float* inRow = (float*)ptrIn + row * hiddenDim;
+                    float* outRow = (float*)ptrOut + row * hiddenDim;
+                    float* wRow = (float*)ptrW;
+                    float* bRow = (float*)ptrB;
+
+                    // Pass 1: Mean
+                    float sum = 0.0f;
+                    int i = 0;
+                    if (Vector.IsHardwareAccelerated && hiddenDim >= vStep)
+                    {
+                        var vSum = Vector<float>.Zero;
+                        int vLimit = (hiddenDim / vStep) * vStep;
+                        for (; i < vLimit; i += vStep)
+                        {
+                            vSum += *(Vector<float>*)(inRow + i);
+                        }
+                        for (int e = 0; e < vStep; e++) sum += vSum[e];
+                    }
+                    for (; i < hiddenDim; i++) sum += inRow[i];
+                    float mean = sum / hiddenDim;
+
+                    // Pass 2: Variance
+                    float sumVar = 0.0f;
+                    int j = 0;
+                    if (Vector.IsHardwareAccelerated && hiddenDim >= vStep)
+                    {
+                        var vMean = new Vector<float>(mean);
+                        var vSumVar = Vector<float>.Zero;
+                        int vLimit = (hiddenDim / vStep) * vStep;
+                        for (; j < vLimit; j += vStep)
+                        {
+                            var diff = *(Vector<float>*)(inRow + j) - vMean;
+                            vSumVar += diff * diff;
+                        }
+                        for (int e = 0; e < vStep; e++) sumVar += vSumVar[e];
+                    }
+                    for (; j < hiddenDim; j++)
+                    {
+                        float diff = inRow[j] - mean;
+                        sumVar += diff * diff;
+                    }
+                    float invStd = 1.0f / (float)Math.Sqrt((sumVar / hiddenDim) + epsilon);
+
+                    // Pass 3: Normalize and Scale/Shift
+                    int k = 0;
+                    if (Vector.IsHardwareAccelerated && hiddenDim >= vStep)
+                    {
+                        var vMean = new Vector<float>(mean);
+                        var vInvStd = new Vector<float>(invStd);
+                        int vLimit = (hiddenDim / vStep) * vStep;
+                        for (; k < vLimit; k += vStep)
+                        {
+                            var norm = (*(Vector<float>*)(inRow + k) - vMean) * vInvStd;
+                            if (hasWeight) norm *= *(Vector<float>*)(wRow + k);
+                            if (hasBias) norm += *(Vector<float>*)(bRow + k);
+                            *(Vector<float>*)(outRow + k) = norm;
+                        }
+                    }
+                    for (; k < hiddenDim; k++)
+                    {
+                        float val = (inRow[k] - mean) * invStd;
+                        if (hasWeight) val *= wRow[k];
+                        if (hasBias) val += bRow[k];
+                        outRow[k] = val;
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
+
+            if (!ReferenceEquals(outContig, output))
+            {
+                outContig.CopyTo(output);
+            }
+        }
+
+        /// <summary>
+        /// Numerically stable row-wise Softmax over the last dimension.
+        /// </summary>
+        public static unsafe void Softmax(Tensor<float> input, Tensor<float> output, int axis = -1)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (input.Length != output.Length)
+                throw new ArgumentException("Input and Output tensor lengths must match.");
+
+            int rank = input.Rank;
+            if (axis < 0) axis += rank;
+            if (axis != rank - 1)
+                throw new NotSupportedException("Optimized Softmax currently supports the last dimension (axis = -1).");
+
+            int rowLength = input.Shape[rank - 1];
+            int rowCount = input.Length / rowLength;
+
+            var inContig = input.ToContiguous();
+            var outContig = output.ToContiguous();
+
+            fixed (float* pIn = inContig.AsSpan())
+            fixed (float* pOut = outContig.AsSpan())
+            {
+                IntPtr ptrIn = (IntPtr)pIn;
+                IntPtr ptrOut = (IntPtr)pOut;
+
+                Compute.For(rowCount, row =>
+                {
+                    float* inRow = (float*)ptrIn + row * rowLength;
+                    float* outRow = (float*)ptrOut + row * rowLength;
+
+                    // 1. Max
+                    float maxVal = float.MinValue;
+                    for (int i = 0; i < rowLength; i++)
+                    {
+                        if (inRow[i] > maxVal) maxVal = inRow[i];
+                    }
+
+                    // 2. Exp and sum
+                    float expSum = 0.0f;
+                    for (int i = 0; i < rowLength; i++)
+                    {
+                        float e = (float)Math.Exp(inRow[i] - maxVal);
+                        outRow[i] = e;
+                        expSum += e;
+                    }
+
+                    // 3. Normalize
+                    float invSum = 1.0f / Math.Max(expSum, 1e-12f);
+                    for (int i = 0; i < rowLength; i++)
+                    {
+                        outRow[i] *= invSum;
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
+
+            if (!ReferenceEquals(outContig, output))
+            {
+                outContig.CopyTo(output);
+            }
         }
     }
 }

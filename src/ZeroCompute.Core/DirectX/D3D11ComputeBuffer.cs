@@ -105,9 +105,8 @@ namespace ZeroCompute.Core.DirectX
             }
         }
 
-        public unsafe void Upload<T>(T[] data) where T : unmanaged
+        public unsafe void Upload<T>(ReadOnlySpan<T> data) where T : unmanaged
         {
-            if (data == null) throw new ArgumentNullException(nameof(data));
             if (data.Length > ElementCount)
                 throw new ArgumentException($"Data length {data.Length} exceeds buffer capacity {ElementCount}.");
 
@@ -117,9 +116,14 @@ namespace ZeroCompute.Core.DirectX
             }
         }
 
-        public unsafe void Download<T>(T[] destination) where T : unmanaged
+        public unsafe void Upload<T>(T[] data) where T : unmanaged
         {
-            if (destination == null) throw new ArgumentNullException(nameof(destination));
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            Upload((ReadOnlySpan<T>)data.AsSpan());
+        }
+
+        public unsafe void Download<T>(Span<T> destination) where T : unmanaged
+        {
             if (_stagingBufferHandle == IntPtr.Zero)
                 throw new InvalidOperationException("Buffer was not created with allowCpuRead: true.");
 
@@ -143,6 +147,12 @@ namespace ZeroCompute.Core.DirectX
             {
                 D3D11Native.Unmap(_context, _stagingBufferHandle, 0);
             }
+        }
+
+        public unsafe void Download<T>(T[] destination) where T : unmanaged
+        {
+            if (destination == null) throw new ArgumentNullException(nameof(destination));
+            Download(destination.AsSpan());
         }
 
         public void Dispose()

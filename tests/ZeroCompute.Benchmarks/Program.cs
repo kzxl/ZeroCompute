@@ -29,6 +29,8 @@ namespace ZeroCompute.Benchmarks
             RunBenchmark6_DispatchLatencyMicro();
             RunBenchmark7_GemmMatrixMultiply();
             RunBenchmark8_GeluActivation();
+            RunBenchmark9_RmsNorm();
+            RunBenchmark10_GpuResidencyChained();
 
             Console.WriteLine("\n[DONE] Benchmark suite finished successfully.");
         }
@@ -479,6 +481,124 @@ namespace ZeroCompute.Benchmarks
             Console.WriteLine($"[1,000,000 elements - 20 runs averaged]");
             Console.WriteLine($"  * Textbook Math.Tanh : {tScalar,8:F2} ms (1.00x)");
             Console.WriteLine($"  * SIMD Padé Rational : {tSimd,8:F2} ms ({(tScalar / tSimd),5:F2}x speedup)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 9: RMSNorm (LLM Normalization)
+
+        private static void RunBenchmark9_RmsNorm()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 9: RMSNorm Normalization (512 Tokens x 4096 Hidden Dim, Float32)");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            const int tokens = 512, hiddenDim = 4096;
+            var input = ZeroTensor.Core.Tensor.Zeros<float>(tokens, hiddenDim);
+            var weight = ZeroTensor.Core.Tensor.Ones(hiddenDim);
+            var outScalar = ZeroTensor.Core.Tensor.Zeros<float>(tokens, hiddenDim);
+            var outSimd = ZeroTensor.Core.Tensor.Zeros<float>(tokens, hiddenDim);
+
+            var rnd = new Random(42);
+            for (int r = 0; r < tokens; r++)
+                for (int c = 0; c < hiddenDim; c++)
+                    input[r, c] = (float)(rnd.NextDouble() * 2.0 - 1.0);
+
+            const int iters = 10;
+
+            // 1. Scalar textbook RMSNorm
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                for (int r = 0; r < tokens; r++)
+                {
+                    float sumSq = 0f;
+                    for (int c = 0; c < hiddenDim; c++)
+                    {
+                        float val = input[r, c];
+                        sumSq += val * val;
+                    }
+                    float invRms = 1.0f / (float)Math.Sqrt((sumSq / hiddenDim) + 1e-5f);
+                    for (int c = 0; c < hiddenDim; c++)
+                    {
+                        outScalar[r, c] = input[r, c] * invRms * weight[c];
+                    }
+                }
+            }
+            sw.Stop();
+            double tScalar = sw.Elapsed.TotalMilliseconds / iters;
+
+            // 2. BlasEngine SIMD + ThreadPool RMSNorm
+            sw.Restart();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                ZeroCompute.Core.Blas.BlasEngine.RmsNorm(input, outSimd, weight, 1e-5f);
+            }
+            sw.Stop();
+            double tSimd = sw.Elapsed.TotalMilliseconds / iters;
+
+            Console.WriteLine($"[512 x 4096 tokens - 10 runs averaged]");
+            Console.WriteLine($"  * Textbook Scalar RMSNorm: {tScalar,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * BlasEngine SIMD RMSNorm: {tSimd,8:F2} ms ({(tScalar / tSimd),5:F2}x speedup)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 10: GPU VRAM Residency vs Host Roundtrips
+
+        private static void RunBenchmark10_GpuResidencyChained()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 10: GPU VRAM Persistent Residency vs Host Roundtrips (GEMM + GELU + RMSNorm)");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            if (!ZeroCompute.Core.ComputeDevice.IsGpuAvailable)
+            {
+                Console.WriteLine("  [SKIP] Direct3D 11 GPU not available in this environment.");
+                Console.WriteLine();
+                return;
+            }
+
+            var gpu = ZeroCompute.Core.ComputeDevice.Gpu;
+            const int M = 256, K = 512, N = 256;
+            var hostA = ZeroTensor.Core.Tensor.Ones(M, K);
+            var hostB = ZeroTensor.Core.Tensor.Ones(K, N);
+
+            const int iters = 20;
+
+            // 1. Host Roundtrips (CPU host memory each step)
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                var hC = ZeroTensor.Core.Tensor.Zeros<float>(M, N);
+                gpu.Gemm(hostA, hostB, hC);
+                gpu.Activation(hC, hC, ZeroCompute.Core.Context.ComputeActivationType.GELU);
+                gpu.RmsNorm(hC, hC, weight: null);
+            }
+            sw.Stop();
+            double tRoundtrip = sw.Elapsed.TotalMilliseconds / iters;
+
+            // 2. Persistent GPU VRAM Residency (zero intermediate PCI-e transfers)
+            var devA = gpu.ToDevice(hostA);
+            var devB = gpu.ToDevice(hostB);
+            var devC = gpu.AllocateDeviceTensor<float>(new ZeroTensor.Core.TensorShape(M, N));
+
+            sw.Restart();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                gpu.Gemm(devA, devB, devC);
+                gpu.Activation(devC, devC, ZeroCompute.Core.Context.ComputeActivationType.GELU);
+                gpu.RmsNorm(devC, devC, weight: null);
+            }
+            var finalHost = devC.ToCpu();
+            sw.Stop();
+            double tPersistent = sw.Elapsed.TotalMilliseconds / iters;
+
+            Console.WriteLine($"[Chained: Gemm(256x512x256) -> GELU -> RMSNorm - 20 runs averaged]");
+            Console.WriteLine($"  * Host Roundtrips (PCI-e Copy x3) : {tRoundtrip,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * Persistent GPU VRAM Residency  : {tPersistent,8:F2} ms ({(tRoundtrip / tPersistent),5:F2}x speedup | PCI-e roundtrips eliminated)");
             Console.WriteLine();
         }
 
