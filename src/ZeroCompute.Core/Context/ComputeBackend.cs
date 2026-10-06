@@ -13,6 +13,8 @@ namespace ZeroCompute.Core.Context
         GELU = 2,
         Sigmoid = 3,
         Tanh = 4,
-        Softmax = 5
+        Softmax = 5,
+        SiLU = 6,
+        None = 99
     }
 }

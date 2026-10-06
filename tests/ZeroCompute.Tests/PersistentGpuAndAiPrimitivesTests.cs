@@ -8,6 +8,7 @@ using ZeroTensor.Core.Storage;
 
 namespace ZeroCompute.Tests
 {
+    [Collection("D3D11Hardware")]
     public class PersistentGpuAndAiPrimitivesTests
     {
         [Fact]

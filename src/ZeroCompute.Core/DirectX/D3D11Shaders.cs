@@ -395,5 +395,220 @@ void CSSoftmax(uint3 threadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
     }
 }
 ";
+
+        public const string FusedGemmShaderSource = @"
+cbuffer FusedGemmParams : register(b0)
+{
+    uint M;
+    uint K;
+    uint N;
+    float Alpha;
+    uint HasBias;
+    uint ActType;
+    float2 Pad;
+};
+
+StructuredBuffer<float> MatrixA : register(t0);
+StructuredBuffer<float> MatrixB : register(t1);
+StructuredBuffer<float> BiasVec : register(t2);
+RWStructuredBuffer<float> MatrixC : register(u0);
+
+#define TILE_DIM 16
+groupshared float tileA[TILE_DIM][TILE_DIM];
+groupshared float tileB[TILE_DIM][TILE_DIM];
+
+[numthreads(TILE_DIM, TILE_DIM, 1)]
+void CSFusedGemm(uint3 threadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    uint row = groupId.y * TILE_DIM + threadId.y;
+    uint col = groupId.x * TILE_DIM + threadId.x;
+    float acc = 0.0f;
+
+    uint numTiles = (K + TILE_DIM - 1) / TILE_DIM;
+    for (uint t = 0; t < numTiles; t++)
+    {
+        uint tiledColA = t * TILE_DIM + threadId.x;
+        uint tiledRowB = t * TILE_DIM + threadId.y;
+
+        tileA[threadId.y][threadId.x] = (row < M && tiledColA < K) ? MatrixA[row * K + tiledColA] : 0.0f;
+        tileB[threadId.y][threadId.x] = (tiledRowB < K && col < N) ? MatrixB[tiledRowB * N + col] : 0.0f;
+
+        GroupMemoryBarrierWithGroupSync();
+
+        [unroll]
+        for (uint k = 0; k < TILE_DIM; k++)
+        {
+            acc += tileA[threadId.y][k] * tileB[k][threadId.x];
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (row < M && col < N)
+    {
+        float val = Alpha * acc;
+        if (HasBias != 0)
+        {
+            val += BiasVec[col];
+        }
+
+        if (ActType == 1) // ReLU
+        {
+            val = max(0.0f, val);
+        }
+        else if (ActType == 2) // GELU
+        {
+            float inner = 0.79788456f * (val + 0.044715f * val * val * val);
+            val = 0.5f * val * (1.0f + tanh(inner));
+        }
+        else if (ActType == 3) // SiLU
+        {
+            val = val / (1.0f + exp(-val));
+        }
+
+        MatrixC[row * N + col] = val;
+    }
+}
+";
+
+        public const string FusedResidualRmsNormShaderSource = @"
+cbuffer FusedResRmsNormParams : register(b0)
+{
+    uint HiddenDim;
+    uint RowCount;
+    float Epsilon;
+    uint HasWeight;
+};
+
+StructuredBuffer<float> InTensor : register(t0);
+StructuredBuffer<float> ResTensor : register(t1);
+StructuredBuffer<float> RmsWeight : register(t2);
+RWStructuredBuffer<float> OutTensor : register(u0);
+
+groupshared float s_resRmsSum[256];
+
+[numthreads(256, 1, 1)]
+void CSFusedResidualRmsNorm(uint3 threadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    uint row = groupId.x;
+    if (row >= RowCount) return;
+
+    uint tid = threadId.x;
+    uint rowOffset = row * HiddenDim;
+
+    float localSumSq = 0.0f;
+    for (uint i = tid; i < HiddenDim; i += 256)
+    {
+        float sumVal = InTensor[rowOffset + i] + ResTensor[rowOffset + i];
+        localSumSq += sumVal * sumVal;
+    }
+
+    s_resRmsSum[tid] = localSumSq;
+    GroupMemoryBarrierWithGroupSync();
+
+    [unroll]
+    for (uint s = 128; s > 0; s >>= 1)
+    {
+        if (tid < s) s_resRmsSum[tid] += s_resRmsSum[tid + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    float meanSq = s_resRmsSum[0] / (float)HiddenDim;
+    float invRms = rsqrt(meanSq + Epsilon);
+
+    for (uint j = tid; j < HiddenDim; j += 256)
+    {
+        float sumVal = InTensor[rowOffset + j] + ResTensor[rowOffset + j];
+        float normVal = sumVal * invRms;
+        if (HasWeight != 0)
+        {
+            normVal *= RmsWeight[j];
+        }
+        OutTensor[rowOffset + j] = normVal;
+    }
+}
+";
+
+        public const string SdpaAttentionShaderSource = @"
+cbuffer SdpaParams : register(b0)
+{
+    uint SeqLenQ;
+    uint SeqLenK;
+    uint HeadDim;
+    uint BatchCount;
+    float Scale;
+    uint IsCausal;
+    float2 Pad;
+};
+
+StructuredBuffer<float> QTensor : register(t0);
+StructuredBuffer<float> KTensor : register(t1);
+StructuredBuffer<float> VTensor : register(t2);
+RWStructuredBuffer<float> OutTensor : register(u0);
+
+groupshared float s_qDotK[128];
+
+[numthreads(128, 1, 1)]
+void CSSdpaAttention(uint3 threadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    uint qIdx = groupId.x;
+    uint bIdx = groupId.y;
+    if (qIdx >= SeqLenQ || bIdx >= BatchCount) return;
+
+    uint tid = threadId.x;
+    uint qBase = (bIdx * SeqLenQ + qIdx) * HeadDim;
+    uint kBase = bIdx * SeqLenK * HeadDim;
+    uint vBase = bIdx * SeqLenK * HeadDim;
+    uint outBase = (bIdx * SeqLenQ + qIdx) * HeadDim;
+
+    float acc = 0.0f;
+    float m = -3.402823466e+38F;
+    float l = 0.0f;
+
+    for (uint kIdx = 0; kIdx < SeqLenK; kIdx++)
+    {
+        if (IsCausal != 0 && kIdx > qIdx)
+        {
+            break;
+        }
+
+        float localDot = 0.0f;
+        for (uint d = tid; d < HeadDim; d += 128)
+        {
+            localDot += QTensor[qBase + d] * KTensor[kBase + kIdx * HeadDim + d];
+        }
+        s_qDotK[tid] = localDot;
+        GroupMemoryBarrierWithGroupSync();
+
+        [unroll]
+        for (uint s = 64; s > 0; s >>= 1)
+        {
+            if (tid < s) s_qDotK[tid] += s_qDotK[tid + s];
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        float score = s_qDotK[0] * Scale;
+        GroupMemoryBarrierWithGroupSync();
+
+        float mNext = max(m, score);
+        float alpha = exp(m - mNext);
+        float beta = exp(score - mNext);
+        l = l * alpha + beta;
+        m = mNext;
+
+        for (uint d2 = tid; d2 < HeadDim; d2 += 128)
+        {
+            float vVal = VTensor[vBase + kIdx * HeadDim + d2];
+            acc = acc * alpha + beta * vVal;
+        }
+    }
+
+    float invL = 1.0f / max(l, 1e-12f);
+    for (uint d3 = tid; d3 < HeadDim; d3 += 128)
+    {
+        OutTensor[outBase + d3] = acc * invL;
+    }
+}
+";
     }
 }

@@ -67,6 +67,54 @@ namespace ZeroCompute.Core.Context
         void Softmax(Tensor<float> input, Tensor<float> output, int axis = -1);
 
         /// <summary>
+        /// Fused GEMM + Bias Addition + Activation: C = Activation(alpha * (A x B) + bias).
+        /// </summary>
+        void FusedGemm(
+            Tensor<float> A,
+            Tensor<float> B,
+            Tensor<float>? bias,
+            Tensor<float> C,
+            ComputeActivationType activation = ComputeActivationType.None,
+            float alpha = 1.0f);
+
+        /// <summary>
+        /// Fused Residual Addition + RMSNorm: output = RMSNorm(input + residual, weight, epsilon).
+        /// </summary>
+        void FusedResidualRmsNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            float epsilon = 1e-5f);
+
+        /// <summary>
+        /// Fused Residual Addition + LayerNorm: output = LayerNorm(input + residual, weight, bias, epsilon).
+        /// </summary>
+        void FusedResidualLayerNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            Tensor<float>? bias = null,
+            float epsilon = 1e-5f);
+
+        /// <summary>
+        /// Scaled Dot-Product Attention (Online Softmax FlashAttention): Output = Softmax(Q * K^T * scale) * V.
+        /// </summary>
+        void ScaledDotProductAttention(
+            Tensor<float> Q,
+            Tensor<float> K,
+            Tensor<float> V,
+            Tensor<float> output,
+            float? scale = null,
+            bool isCausal = false);
+
+        /// <summary>
+        /// Half-precision (FP16) General Matrix Multiplication: C = A @ B.
+        /// </summary>
+        void Gemm(Tensor<Half> A, Tensor<Half> B, Tensor<Half> C);
+
+        /// <summary>
         /// Reduces tensor along the specified axis (e.g., sum, max).
         /// </summary>
         Tensor<float> ReduceSum(Tensor<float> input, int axis);

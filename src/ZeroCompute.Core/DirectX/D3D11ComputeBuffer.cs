@@ -14,6 +14,7 @@ namespace ZeroCompute.Core.DirectX
         private IntPtr _stagingBufferHandle;
         private readonly IntPtr _device;
         private readonly IntPtr _context;
+        private readonly object _syncLock;
         private bool _disposed;
 
         public int ElementCount { get; }
@@ -24,10 +25,11 @@ namespace ZeroCompute.Core.DirectX
         public IntPtr UavHandle => _uavHandle;
         public IntPtr SrvHandle => _srvHandle;
 
-        internal D3D11ComputeBuffer(IntPtr device, IntPtr context, int elementCount, int elementStride, bool createUav, bool createSrv, bool allowCpuRead)
+        internal D3D11ComputeBuffer(IntPtr device, IntPtr context, int elementCount, int elementStride, bool createUav, bool createSrv, bool allowCpuRead, object? syncLock = null)
         {
             _device = device;
             _context = context;
+            _syncLock = syncLock ?? new object();
             ElementCount = elementCount;
             ElementStride = elementStride;
 
@@ -110,9 +112,12 @@ namespace ZeroCompute.Core.DirectX
             if (data.Length > ElementCount)
                 throw new ArgumentException($"Data length {data.Length} exceeds buffer capacity {ElementCount}.");
 
-            fixed (T* ptr = data)
+            lock (_syncLock)
             {
-                D3D11Native.UpdateSubresource(_context, _bufferHandle, (IntPtr)ptr);
+                fixed (T* ptr = data)
+                {
+                    D3D11Native.UpdateSubresource(_context, _bufferHandle, (IntPtr)ptr);
+                }
             }
         }
 
@@ -127,25 +132,28 @@ namespace ZeroCompute.Core.DirectX
             if (_stagingBufferHandle == IntPtr.Zero)
                 throw new InvalidOperationException("Buffer was not created with allowCpuRead: true.");
 
-            // Copy GPU Default buffer -> GPU Staging buffer
-            D3D11Native.CopyResource(_context, _stagingBufferHandle, _bufferHandle);
-
-            // Map staging buffer
-            int hr = D3D11Native.Map(_context, _stagingBufferHandle, 0, D3D11Native.D3D11_MAP_READ, 0, out var mapped);
-            if (hr < 0) throw new InvalidOperationException($"Failed to map staging buffer (HRESULT 0x{hr:X8}).");
-
-            try
+            lock (_syncLock)
             {
-                int copyCount = Math.Min(destination.Length, ElementCount);
-                int byteCount = copyCount * ElementStride;
-                fixed (T* pDst = destination)
+                // Copy GPU Default buffer -> GPU Staging buffer
+                D3D11Native.CopyResource(_context, _stagingBufferHandle, _bufferHandle);
+
+                // Map staging buffer
+                int hr = D3D11Native.Map(_context, _stagingBufferHandle, 0, D3D11Native.D3D11_MAP_READ, 0, out var mapped);
+                if (hr < 0) throw new InvalidOperationException($"Failed to map staging buffer (HRESULT 0x{hr:X8}).");
+
+                try
                 {
-                    Buffer.MemoryCopy((void*)mapped.pData, pDst, byteCount, byteCount);
+                    int copyCount = Math.Min(destination.Length, ElementCount);
+                    int byteCount = copyCount * ElementStride;
+                    fixed (T* pDst = destination)
+                    {
+                        Buffer.MemoryCopy((void*)mapped.pData, pDst, byteCount, byteCount);
+                    }
                 }
-            }
-            finally
-            {
-                D3D11Native.Unmap(_context, _stagingBufferHandle, 0);
+                finally
+                {
+                    D3D11Native.Unmap(_context, _stagingBufferHandle, 0);
+                }
             }
         }
 

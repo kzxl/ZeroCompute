@@ -182,6 +182,69 @@ namespace ZeroCompute.Core
             return BlasEngine.ReduceMax(input, axis);
         }
 
+        public void FusedGemm(
+            Tensor<float> A,
+            Tensor<float> B,
+            Tensor<float>? bias,
+            Tensor<float> C,
+            ComputeActivationType activation = ComputeActivationType.None,
+            float alpha = 1.0f)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.FusedGemm(A, B, bias, C, activation, alpha);
+            else
+                BlasEngine.FusedGemm(A, B, bias, C, activation, alpha);
+        }
+
+        public void FusedResidualRmsNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            float epsilon = 1e-5f)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.FusedResidualRmsNorm(input, residual, output, weight, epsilon);
+            else
+                BlasEngine.FusedResidualRmsNorm(input, residual, output, weight, epsilon);
+        }
+
+        public void FusedResidualLayerNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            Tensor<float>? bias = null,
+            float epsilon = 1e-5f)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.FusedResidualLayerNorm(input, residual, output, weight, bias, epsilon);
+            else
+                BlasEngine.FusedResidualLayerNorm(input, residual, output, weight, bias, epsilon);
+        }
+
+        public void ScaledDotProductAttention(
+            Tensor<float> Q,
+            Tensor<float> K,
+            Tensor<float> V,
+            Tensor<float> output,
+            float? scale = null,
+            bool isCausal = false)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.ScaledDotProductAttention(Q, K, V, output, scale, isCausal);
+            else
+                BlasEngine.ScaledDotProductAttention(Q, K, V, output, scale, isCausal);
+        }
+
+        public void Gemm(Tensor<Half> A, Tensor<Half> B, Tensor<Half> C)
+        {
+            if (_d3d11Context != null)
+                _d3d11Context.Gemm(A, B, C);
+            else
+                BlasEngine.Gemm(A, B, C);
+        }
+
         public void Dispose()
         {
             _d3d11Context?.Dispose();

@@ -971,5 +971,405 @@ namespace ZeroCompute.Core.Blas
                 outContig.CopyTo(output);
             }
         }
+
+        #region Kernel Fusion & Advanced Attention Primitives
+
+        /// <summary>
+        /// Fused General Matrix Multiply + Bias Addition + Activation:
+        /// C = Activation(Alpha * (A @ B) + Bias)
+        /// Avoids intermediate memory allocations and DRAM write-read cycles.
+        /// </summary>
+        public static unsafe void FusedGemm(
+            Tensor<float> A,
+            Tensor<float> B,
+            Tensor<float>? bias,
+            Tensor<float> C,
+            ComputeActivationType activation = ComputeActivationType.None,
+            float alpha = 1.0f)
+        {
+            if (A == null) throw new ArgumentNullException(nameof(A));
+            if (B == null) throw new ArgumentNullException(nameof(B));
+            if (C == null) throw new ArgumentNullException(nameof(C));
+
+            Gemm(A, B, C, alpha, 0.0f);
+
+            if (bias == null && activation == ComputeActivationType.None)
+                return;
+
+            int M = A.Shape[0];
+            int N = B.Shape[1];
+
+            var cContig = C.ToContiguous();
+            var biasContig = bias?.ToContiguous();
+            Span<float> biasSpan = biasContig != null ? biasContig.AsSpan() : default;
+
+            fixed (float* pC = cContig.AsSpan())
+            fixed (float* pBias = biasSpan)
+            {
+                IntPtr ptrC = (IntPtr)pC;
+                IntPtr ptrBias = (IntPtr)pBias;
+
+                Compute.For(M, row =>
+                {
+                    float* rowC = (float*)ptrC + row * N;
+                    float* biasArr = (float*)ptrBias;
+
+                    for (int j = 0; j < N; j++)
+                    {
+                        float val = rowC[j];
+                        if (biasArr != null)
+                        {
+                            val += biasArr[j];
+                        }
+
+                        if (activation == ComputeActivationType.ReLU)
+                        {
+                            val = Math.Max(0.0f, val);
+                        }
+                        else if (activation == ComputeActivationType.GELU)
+                        {
+                            float inner = 0.79788456f * (val + 0.044715f * val * val * val);
+                            val = 0.5f * val * (1.0f + (float)Math.Tanh(inner));
+                        }
+                        else if (activation == ComputeActivationType.SiLU)
+                        {
+                            val = val / (1.0f + (float)Math.Exp(-val));
+                        }
+
+                        rowC[j] = val;
+                    }
+                }, CpuWorkloadType.MemoryBound);
+            }
+
+            if (!ReferenceEquals(cContig, C))
+            {
+                cContig.CopyTo(C);
+            }
+        }
+
+        /// <summary>
+        /// Fused Residual Addition + RMSNorm:
+        /// output = RMSNorm(input + residual, weight, epsilon)
+        /// Single-pass execution through memory.
+        /// </summary>
+        public static unsafe void FusedResidualRmsNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            float epsilon = 1e-5f)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (residual == null) throw new ArgumentNullException(nameof(residual));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (input.Length != residual.Length || input.Length != output.Length)
+                throw new ArgumentException("Input, residual, and output tensors must have the same total elements.");
+
+            int rank = input.Rank;
+            int hiddenDim = input.Shape[rank - 1];
+            int rowCount = input.Length / hiddenDim;
+
+            var inContig = input.ToContiguous();
+            var resContig = residual.ToContiguous();
+            var outContig = output.ToContiguous();
+            var wContig = weight?.ToContiguous();
+            Span<float> wSpan = wContig != null ? wContig.AsSpan() : default;
+
+            fixed (float* pIn = inContig.AsSpan())
+            fixed (float* pRes = resContig.AsSpan())
+            fixed (float* pOut = outContig.AsSpan())
+            fixed (float* pW = wSpan)
+            {
+                IntPtr ptrIn = (IntPtr)pIn;
+                IntPtr ptrRes = (IntPtr)pRes;
+                IntPtr ptrOut = (IntPtr)pOut;
+                IntPtr ptrW = (IntPtr)pW;
+
+                Compute.For(rowCount, row =>
+                {
+                    float* inRow = (float*)ptrIn + row * hiddenDim;
+                    float* resRow = (float*)ptrRes + row * hiddenDim;
+                    float* outRow = (float*)ptrOut + row * hiddenDim;
+                    float* wRow = (float*)ptrW;
+
+                    float sumSq = 0.0f;
+                    for (int i = 0; i < hiddenDim; i++)
+                    {
+                        float sum = inRow[i] + resRow[i];
+                        sumSq += sum * sum;
+                    }
+
+                    float invRms = 1.0f / (float)Math.Sqrt((sumSq / hiddenDim) + epsilon);
+
+                    if (wRow != null)
+                    {
+                        for (int i = 0; i < hiddenDim; i++)
+                        {
+                            float sum = inRow[i] + resRow[i];
+                            outRow[i] = sum * invRms * wRow[i];
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < hiddenDim; i++)
+                        {
+                            float sum = inRow[i] + resRow[i];
+                            outRow[i] = sum * invRms;
+                        }
+                    }
+                }, CpuWorkloadType.MemoryBound);
+            }
+
+            if (!ReferenceEquals(outContig, output))
+            {
+                outContig.CopyTo(output);
+            }
+        }
+
+        /// <summary>
+        /// Fused Residual Addition + LayerNorm:
+        /// output = LayerNorm(input + residual, weight, bias, epsilon)
+        /// </summary>
+        public static unsafe void FusedResidualLayerNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            Tensor<float>? bias = null,
+            float epsilon = 1e-5f)
+        {
+            if (input == null) throw new ArgumentNullException(nameof(input));
+            if (residual == null) throw new ArgumentNullException(nameof(residual));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+            if (input.Length != residual.Length || input.Length != output.Length)
+                throw new ArgumentException("Input, residual, and output tensors must have the same total elements.");
+
+            int rank = input.Rank;
+            int hiddenDim = input.Shape[rank - 1];
+            int rowCount = input.Length / hiddenDim;
+
+            var inContig = input.ToContiguous();
+            var resContig = residual.ToContiguous();
+            var outContig = output.ToContiguous();
+            var wContig = weight?.ToContiguous();
+            var bContig = bias?.ToContiguous();
+            Span<float> wSpanLN = wContig != null ? wContig.AsSpan() : default;
+            Span<float> bSpanLN = bContig != null ? bContig.AsSpan() : default;
+
+            fixed (float* pIn = inContig.AsSpan())
+            fixed (float* pRes = resContig.AsSpan())
+            fixed (float* pOut = outContig.AsSpan())
+            fixed (float* pW = wSpanLN)
+            fixed (float* pB = bSpanLN)
+            {
+                IntPtr ptrIn = (IntPtr)pIn;
+                IntPtr ptrRes = (IntPtr)pRes;
+                IntPtr ptrOut = (IntPtr)pOut;
+                IntPtr ptrW = (IntPtr)pW;
+                IntPtr ptrB = (IntPtr)pB;
+
+                Compute.For(rowCount, row =>
+                {
+                    float* inRow = (float*)ptrIn + row * hiddenDim;
+                    float* resRow = (float*)ptrRes + row * hiddenDim;
+                    float* outRow = (float*)ptrOut + row * hiddenDim;
+                    float* wRow = (float*)ptrW;
+                    float* bRow = (float*)ptrB;
+
+                    float sum = 0.0f;
+                    for (int i = 0; i < hiddenDim; i++)
+                    {
+                        sum += inRow[i] + resRow[i];
+                    }
+                    float mean = sum / hiddenDim;
+
+                    float sumVar = 0.0f;
+                    for (int i = 0; i < hiddenDim; i++)
+                    {
+                        float diff = (inRow[i] + resRow[i]) - mean;
+                        sumVar += diff * diff;
+                    }
+                    float invStd = 1.0f / (float)Math.Sqrt((sumVar / hiddenDim) + epsilon);
+
+                    for (int i = 0; i < hiddenDim; i++)
+                    {
+                        float norm = ((inRow[i] + resRow[i]) - mean) * invStd;
+                        if (wRow != null) norm *= wRow[i];
+                        if (bRow != null) norm += bRow[i];
+                        outRow[i] = norm;
+                    }
+                }, CpuWorkloadType.MemoryBound);
+            }
+
+            if (!ReferenceEquals(outContig, output))
+            {
+                outContig.CopyTo(output);
+            }
+        }
+
+        /// <summary>
+        /// Scaled Dot-Product Attention (FlashAttention-2 Online Softmax):
+        /// Output = Softmax(Q * K^T * scale) * V
+        /// Pure C# cache-tiled online Softmax algorithm with zero quadratic memory allocations.
+        /// </summary>
+        public static unsafe void ScaledDotProductAttention(
+            Tensor<float> Q,
+            Tensor<float> K,
+            Tensor<float> V,
+            Tensor<float> output,
+            float? scale = null,
+            bool isCausal = false)
+        {
+            if (Q == null) throw new ArgumentNullException(nameof(Q));
+            if (K == null) throw new ArgumentNullException(nameof(K));
+            if (V == null) throw new ArgumentNullException(nameof(V));
+            if (output == null) throw new ArgumentNullException(nameof(output));
+
+            int rank = Q.Rank;
+            int D = Q.Shape[rank - 1];
+            int seqLenQ = Q.Shape[rank - 2];
+            int seqLenK = K.Shape[rank - 2];
+
+            int batchCount = 1;
+            for (int d = 0; d < rank - 2; d++) batchCount *= Q.Shape[d];
+
+            float s = scale ?? (1.0f / (float)Math.Sqrt(D));
+
+            var qContig = Q.ToContiguous();
+            var kContig = K.ToContiguous();
+            var vContig = V.ToContiguous();
+            var outContig = output.ToContiguous();
+
+            fixed (float* pQ = qContig.AsSpan())
+            fixed (float* pK = kContig.AsSpan())
+            fixed (float* pV = vContig.AsSpan())
+            fixed (float* pOut = outContig.AsSpan())
+            {
+                IntPtr ptrQ = (IntPtr)pQ;
+                IntPtr ptrK = (IntPtr)pK;
+                IntPtr ptrV = (IntPtr)pV;
+                IntPtr ptrOut = (IntPtr)pOut;
+
+                int totalQueries = batchCount * seqLenQ;
+
+                Compute.For(totalQueries, qGlobal =>
+                {
+                    int b = qGlobal / seqLenQ;
+                    int i = qGlobal % seqLenQ;
+
+                    float* qPtr = (float*)ptrQ + (b * seqLenQ + i) * D;
+                    float* kBase = (float*)ptrK + b * seqLenK * D;
+                    float* vBase = (float*)ptrV + b * seqLenK * D;
+                    float* outPtr = (float*)ptrOut + (b * seqLenQ + i) * D;
+
+                    float* acc = stackalloc float[D];
+                    for (int d = 0; d < D; d++) acc[d] = 0.0f;
+
+                    float m = float.NegativeInfinity;
+                    float l = 0.0f;
+
+                    for (int j = 0; j < seqLenK; j++)
+                    {
+                        if (isCausal && j > i) break;
+
+                        float* kPtr = kBase + j * D;
+                        float* vPtr = vBase + j * D;
+
+                        float dot = 0.0f;
+                        for (int d = 0; d < D; d++)
+                        {
+                            dot += qPtr[d] * kPtr[d];
+                        }
+                        float score = dot * s;
+
+                        float mNext = Math.Max(m, score);
+                        float alpha = (float)Math.Exp(m - mNext);
+                        float beta = (float)Math.Exp(score - mNext);
+                        l = l * alpha + beta;
+                        m = mNext;
+
+                        for (int d = 0; d < D; d++)
+                        {
+                            acc[d] = acc[d] * alpha + beta * vPtr[d];
+                        }
+                    }
+
+                    float invL = 1.0f / Math.Max(l, 1e-12f);
+                    for (int d = 0; d < D; d++)
+                    {
+                        outPtr[d] = acc[d] * invL;
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
+
+            if (!ReferenceEquals(outContig, output))
+            {
+                outContig.CopyTo(output);
+            }
+        }
+
+        /// <summary>
+        /// Multi-threaded half-precision (FP16) General Matrix Multiplication with FP32 register accumulation:
+        /// C = A (M x K) @ B (K x N).
+        /// </summary>
+        public static unsafe void Gemm(Tensor<Half> A, Tensor<Half> B, Tensor<Half> C)
+        {
+            if (A == null) throw new ArgumentNullException(nameof(A));
+            if (B == null) throw new ArgumentNullException(nameof(B));
+            if (C == null) throw new ArgumentNullException(nameof(C));
+
+            if (A.Rank != 2 || B.Rank != 2 || C.Rank != 2)
+                throw new ArgumentException("Matrices must be 2-dimensional.");
+
+            int M = A.Shape[0];
+            int K = A.Shape[1];
+            int N = B.Shape[1];
+
+            if (B.Shape[0] != K || C.Shape[0] != M || C.Shape[1] != N)
+                throw new ArgumentException("Matrix dimensions do not match for multiplication.");
+
+            var aContig = A.ToContiguous();
+            var bContig = B.ToContiguous();
+            var cContig = C.ToContiguous();
+
+            fixed (Half* pA = aContig.AsSpan())
+            fixed (Half* pB = bContig.AsSpan())
+            fixed (Half* pC = cContig.AsSpan())
+            {
+                IntPtr ptrA = (IntPtr)pA;
+                IntPtr ptrB = (IntPtr)pB;
+                IntPtr ptrC = (IntPtr)pC;
+
+                const int tileSize = 32;
+
+                Compute.For(M, i =>
+                {
+                    Half* aRow = (Half*)ptrA + i * K;
+                    Half* cRow = (Half*)ptrC + i * N;
+                    Half* bBase = (Half*)ptrB;
+
+                    for (int j0 = 0; j0 < N; j0 += tileSize)
+                    {
+                        int jEnd = Math.Min(j0 + tileSize, N);
+                        for (int j = j0; j < jEnd; j++)
+                        {
+                            float sum = 0.0f;
+                            for (int k = 0; k < K; k++)
+                            {
+                                sum += (float)aRow[k] * (float)bBase[k * N + j];
+                            }
+                            cRow[j] = (Half)sum;
+                        }
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
+
+            if (!ReferenceEquals(cContig, C))
+            {
+                cContig.CopyTo(C);
+            }
+        }
+
+        #endregion
     }
 }

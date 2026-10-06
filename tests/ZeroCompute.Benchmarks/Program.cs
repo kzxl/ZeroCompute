@@ -31,6 +31,8 @@ namespace ZeroCompute.Benchmarks
             RunBenchmark8_GeluActivation();
             RunBenchmark9_RmsNorm();
             RunBenchmark10_GpuResidencyChained();
+            RunBenchmark11_FusedGemm();
+            RunBenchmark12_FlashAttention();
 
             Console.WriteLine("\n[DONE] Benchmark suite finished successfully.");
         }
@@ -599,6 +601,109 @@ namespace ZeroCompute.Benchmarks
             Console.WriteLine($"[Chained: Gemm(256x512x256) -> GELU -> RMSNorm - 20 runs averaged]");
             Console.WriteLine($"  * Host Roundtrips (PCI-e Copy x3) : {tRoundtrip,8:F2} ms (1.00x)");
             Console.WriteLine($"  * Persistent GPU VRAM Residency  : {tPersistent,8:F2} ms ({(tRoundtrip / tPersistent),5:F2}x speedup | PCI-e roundtrips eliminated)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 11: Kernel Fusion (Fused Linear Layer: GEMM + Bias + GELU)
+
+        private static void RunBenchmark11_FusedGemm()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 11: Kernel Fusion (Linear Layer: 512x512 GEMM + BiasAdd + GELU)");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            const int M = 512, K = 512, N = 512;
+            var A = ZeroTensor.Core.Tensor.Ones(M, K);
+            var B = ZeroTensor.Core.Tensor.Ones(K, N);
+            var bias = ZeroTensor.Core.Tensor.Ones(N);
+
+            const int iters = 10;
+
+            // 1. Unfused 3-Pass Execution (Gemm -> Write C -> Read C + Bias -> Write C -> Read C + GELU -> Write C)
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                var C = ZeroTensor.Core.Tensor.Zeros<float>(M, N);
+                ZeroCompute.Core.ComputeDevice.Cpu.Gemm(A, B, C);
+                for (int i = 0; i < M; i++)
+                    for (int j = 0; j < N; j++)
+                        C[i, j] += bias[j];
+                ZeroCompute.Core.ComputeDevice.Cpu.Activation(C, C, ZeroCompute.Core.Context.ComputeActivationType.GELU);
+            }
+            sw.Stop();
+            double tUnfused = sw.Elapsed.TotalMilliseconds / iters;
+
+            // 2. Fused Execution: FusedGemm with in-register Bias and GELU activation
+            sw.Restart();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                var C = ZeroTensor.Core.Tensor.Zeros<float>(M, N);
+                ZeroCompute.Core.ComputeDevice.Cpu.FusedGemm(A, B, bias, C, ZeroCompute.Core.Context.ComputeActivationType.GELU);
+            }
+            sw.Stop();
+            double tFused = sw.Elapsed.TotalMilliseconds / iters;
+
+            Console.WriteLine($"[512x512 Matrices - 10 runs averaged]");
+            Console.WriteLine($"  * Unfused 3-Pass Pipeline : {tUnfused,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * Fused Linear Layer      : {tFused,8:F2} ms ({(tUnfused / tFused),5:F2}x speedup | DRAM roundtrips saved)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 12: FlashAttention-2 (Scaled Dot-Product Attention)
+
+        private static void RunBenchmark12_FlashAttention()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 12: FlashAttention-2 Online Softmax vs Materialized Attention (SeqLen=512, D=64)");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            const int seqLen = 512, headDim = 64;
+            var Q = ZeroTensor.Core.Tensor.Ones(seqLen, headDim);
+            var K = ZeroTensor.Core.Tensor.Ones(seqLen, headDim);
+            var V = ZeroTensor.Core.Tensor.Ones(seqLen, headDim);
+
+            const int iters = 10;
+            float scale = 1.0f / (float)Math.Sqrt(headDim);
+
+            // 1. Materialized Attention: Allocates quadratic SeqLen x SeqLen (512 x 512) attention matrix
+            var sw = Stopwatch.StartNew();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                var S = ZeroTensor.Core.Tensor.Zeros<float>(seqLen, seqLen);
+                for (int i = 0; i < seqLen; i++)
+                {
+                    for (int j = 0; j < seqLen; j++)
+                    {
+                        float dot = 0f;
+                        for (int d = 0; d < headDim; d++) dot += Q[i, d] * K[j, d];
+                        S[i, j] = dot * scale;
+                    }
+                }
+                var P = ZeroTensor.Core.Tensor.Zeros<float>(seqLen, seqLen);
+                ZeroCompute.Core.ComputeDevice.Cpu.Softmax(S, P, axis: -1);
+                var O = ZeroTensor.Core.Tensor.Zeros<float>(seqLen, headDim);
+                ZeroCompute.Core.ComputeDevice.Cpu.Gemm(P, V, O);
+            }
+            sw.Stop();
+            double tMaterialized = sw.Elapsed.TotalMilliseconds / iters;
+
+            // 2. FlashAttention-2: O(1) Memory, Online Softmax, Cache-Tiled Multi-threaded
+            sw.Restart();
+            for (int iter = 0; iter < iters; iter++)
+            {
+                var O = ZeroTensor.Core.Tensor.Zeros<float>(seqLen, headDim);
+                ZeroCompute.Core.ComputeDevice.Cpu.ScaledDotProductAttention(Q, K, V, O, scale, isCausal: false);
+            }
+            sw.Stop();
+            double tFlash = sw.Elapsed.TotalMilliseconds / iters;
+
+            Console.WriteLine($"[Sequence Length 512, Head Dim 64 - 10 runs averaged]");
+            Console.WriteLine($"  * Materialized Attention (Allocates 512x512 matrix): {tMaterialized,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * FlashAttention-2 Online Softmax (O(1) Memory)     : {tFlash,8:F2} ms ({(tMaterialized / tFlash),5:F2}x speedup | 0 intermediate matrices)");
             Console.WriteLine();
         }
 

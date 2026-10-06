@@ -24,6 +24,8 @@ namespace ZeroCompute.Core.DirectX
         public bool IsHardwareAccelerated => _isHardwareAccelerated;
         public IntPtr DeviceHandle => _device;
         public IntPtr ContextHandle => _context;
+        private readonly object _syncLock = new object();
+        public object SyncLock => _syncLock;
 
         // Cached compute shaders
         private IntPtr _gemmShader;
@@ -33,6 +35,9 @@ namespace ZeroCompute.Core.DirectX
         private IntPtr _rmsNormShader;
         private IntPtr _layerNormShader;
         private IntPtr _softmaxShader;
+        private IntPtr _fusedGemmShader;
+        private IntPtr _fusedResRmsNormShader;
+        private IntPtr _sdpaShader;
 
         // Cached constant buffers
         private IntPtr _gemmCb;
@@ -42,6 +47,9 @@ namespace ZeroCompute.Core.DirectX
         private IntPtr _rmsNormCb;
         private IntPtr _layerNormCb;
         private IntPtr _softmaxCb;
+        private IntPtr _fusedGemmCb;
+        private IntPtr _fusedResRmsNormCb;
+        private IntPtr _sdpaCb;
 
         [StructLayout(LayoutKind.Sequential, Size = 32)]
         private struct GemmCbData
@@ -110,6 +118,41 @@ namespace ZeroCompute.Core.DirectX
         {
             public uint RowLength;
             public uint RowCount;
+            public float Pad0;
+            public float Pad1;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Size = 32)]
+        private struct FusedGemmCbData
+        {
+            public uint M;
+            public uint K;
+            public uint N;
+            public float Alpha;
+            public uint HasBias;
+            public uint ActType;
+            public float Pad0;
+            public float Pad1;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Size = 16)]
+        private struct FusedResRmsNormCbData
+        {
+            public uint HiddenDim;
+            public uint RowCount;
+            public float Epsilon;
+            public uint HasWeight;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Size = 32)]
+        private struct SdpaCbData
+        {
+            public uint SeqLenQ;
+            public uint SeqLenK;
+            public uint HeadDim;
+            public uint BatchCount;
+            public float Scale;
+            public uint IsCausal;
             public float Pad0;
             public float Pad1;
         }
@@ -204,7 +247,7 @@ namespace ZeroCompute.Core.DirectX
                 throw new InvalidOperationException("Direct3D 11 device is not available on this platform/configuration.");
 
             int stride = Marshal.SizeOf(typeof(T));
-            return new D3D11ComputeBuffer(_device, _context, count, stride, allowUav, true, cpuRead);
+            return new D3D11ComputeBuffer(_device, _context, count, stride, allowUav, true, cpuRead, _syncLock);
         }
 
         public IntPtr CreateComputeShader(byte[] bytecode)
@@ -291,42 +334,45 @@ namespace ZeroCompute.Core.DirectX
             if (computeShader == IntPtr.Zero)
                 throw new ArgumentNullException(nameof(computeShader));
 
-            // Set CS Shader (Slot 69)
-            D3D11Native.CSSetShader(_context, computeShader);
-
-            // Bind UAVs (Slot 68)
-            if (uavs != null && uavs.Length > 0)
+            lock (_syncLock)
             {
-                var uavHandles = new IntPtr[uavs.Length];
-                for (int i = 0; i < uavs.Length; i++) uavHandles[i] = uavs[i].UavHandle;
-                D3D11Native.CSSetUnorderedAccessViews(_context, 0, uavHandles);
+                // Set CS Shader (Slot 69)
+                D3D11Native.CSSetShader(_context, computeShader);
+
+                // Bind UAVs (Slot 68)
+                if (uavs != null && uavs.Length > 0)
+                {
+                    var uavHandles = new IntPtr[uavs.Length];
+                    for (int i = 0; i < uavs.Length; i++) uavHandles[i] = uavs[i].UavHandle;
+                    D3D11Native.CSSetUnorderedAccessViews(_context, 0, uavHandles);
+                }
+
+                // Bind SRVs (Slot 67)
+                if (srvs != null && srvs.Length > 0)
+                {
+                    var srvHandles = new IntPtr[srvs.Length];
+                    for (int i = 0; i < srvs.Length; i++) srvHandles[i] = srvs[i].SrvHandle;
+                    D3D11Native.CSSetShaderResources(_context, 0, srvHandles);
+                }
+
+                // Dispatch (Slot 41)
+                D3D11Native.Dispatch(_context, (uint)groupsX, (uint)groupsY, (uint)groupsZ);
+
+                // Unbind
+                if (uavs != null && uavs.Length > 0)
+                {
+                    var nullUavs = new IntPtr[uavs.Length];
+                    D3D11Native.CSSetUnorderedAccessViews(_context, 0, nullUavs);
+                }
+
+                if (srvs != null && srvs.Length > 0)
+                {
+                    var nullSrvs = new IntPtr[srvs.Length];
+                    D3D11Native.CSSetShaderResources(_context, 0, nullSrvs);
+                }
+
+                D3D11Native.CSSetShader(_context, IntPtr.Zero);
             }
-
-            // Bind SRVs (Slot 67)
-            if (srvs != null && srvs.Length > 0)
-            {
-                var srvHandles = new IntPtr[srvs.Length];
-                for (int i = 0; i < srvs.Length; i++) srvHandles[i] = srvs[i].SrvHandle;
-                D3D11Native.CSSetShaderResources(_context, 0, srvHandles);
-            }
-
-            // Dispatch (Slot 41)
-            D3D11Native.Dispatch(_context, (uint)groupsX, (uint)groupsY, (uint)groupsZ);
-
-            // Unbind
-            if (uavs != null && uavs.Length > 0)
-            {
-                var nullUavs = new IntPtr[uavs.Length];
-                D3D11Native.CSSetUnorderedAccessViews(_context, 0, nullUavs);
-            }
-
-            if (srvs != null && srvs.Length > 0)
-            {
-                var nullSrvs = new IntPtr[srvs.Length];
-                D3D11Native.CSSetShaderResources(_context, 0, nullSrvs);
-            }
-
-            D3D11Native.CSSetShader(_context, IntPtr.Zero);
         }
 
         #endregion
@@ -400,6 +446,36 @@ namespace ZeroCompute.Core.DirectX
                 byte[] bytecode = D3D11Compiler.CompileComputeShader(D3D11Shaders.SoftmaxShaderSource, "CSSoftmax");
                 _softmaxShader = CreateComputeShader(bytecode);
                 _softmaxCb = CreateConstantBuffer((uint)Marshal.SizeOf<SoftmaxCbData>());
+            }
+        }
+
+        private void EnsureFusedGemmPipeline()
+        {
+            if (_fusedGemmShader == IntPtr.Zero)
+            {
+                byte[] bytecode = D3D11Compiler.CompileComputeShader(D3D11Shaders.FusedGemmShaderSource, "CSFusedGemm");
+                _fusedGemmShader = CreateComputeShader(bytecode);
+                _fusedGemmCb = CreateConstantBuffer((uint)Marshal.SizeOf<FusedGemmCbData>());
+            }
+        }
+
+        private void EnsureFusedResRmsNormPipeline()
+        {
+            if (_fusedResRmsNormShader == IntPtr.Zero)
+            {
+                byte[] bytecode = D3D11Compiler.CompileComputeShader(D3D11Shaders.FusedResidualRmsNormShaderSource, "CSFusedResidualRmsNorm");
+                _fusedResRmsNormShader = CreateComputeShader(bytecode);
+                _fusedResRmsNormCb = CreateConstantBuffer((uint)Marshal.SizeOf<FusedResRmsNormCbData>());
+            }
+        }
+
+        private void EnsureSdpaPipeline()
+        {
+            if (_sdpaShader == IntPtr.Zero)
+            {
+                byte[] bytecode = D3D11Compiler.CompileComputeShader(D3D11Shaders.SdpaAttentionShaderSource, "CSSdpaAttention");
+                _sdpaShader = CreateComputeShader(bytecode);
+                _sdpaCb = CreateConstantBuffer((uint)Marshal.SizeOf<SdpaCbData>());
             }
         }
 
@@ -956,6 +1032,285 @@ namespace ZeroCompute.Core.DirectX
             return BlasEngine.ReduceMax(input, axis);
         }
 
+        #region Kernel Fusion & SDPA Operations
+
+        public unsafe void FusedGemm(
+            Tensor<float> A,
+            Tensor<float> B,
+            Tensor<float>? bias,
+            Tensor<float> C,
+            ComputeActivationType activation = ComputeActivationType.None,
+            float alpha = 1.0f)
+        {
+            if (!_isHardwareAccelerated)
+            {
+                BlasEngine.FusedGemm(A, B, bias, C, activation, alpha);
+                return;
+            }
+
+            try
+            {
+                EnsureFusedGemmPipeline();
+
+                int M = A.Shape[0];
+                int K = A.Shape[1];
+                int N = B.Shape[1];
+
+                using var scopeA = BindInputBuffer(A, allowUav: false);
+                using var scopeB = BindInputBuffer(B, allowUav: false);
+                using var scopeC = BindOutputBuffer(C, out bool needsDownload);
+
+                D3D11ComputeBuffer srvA = scopeA.Buffer;
+                D3D11ComputeBuffer srvB = scopeB.Buffer;
+                D3D11ComputeBuffer? scratchA = null;
+                D3D11ComputeBuffer? scratchB = null;
+
+                if (scopeA.Buffer.BufferHandle == scopeC.Buffer.BufferHandle)
+                {
+                    scratchA = CreateStructuredBuffer<float>(A.Length, allowUav: false, cpuRead: false);
+                    D3D11Native.CopyResource(_context, scratchA.BufferHandle, scopeA.Buffer.BufferHandle);
+                    srvA = scratchA;
+                }
+                if (scopeB.Buffer.BufferHandle == scopeC.Buffer.BufferHandle)
+                {
+                    scratchB = CreateStructuredBuffer<float>(B.Length, allowUav: false, cpuRead: false);
+                    D3D11Native.CopyResource(_context, scratchB.BufferHandle, scopeB.Buffer.BufferHandle);
+                    srvB = scratchB;
+                }
+
+                D3D11ComputeBuffer? biasBuf = null;
+                bool isTempBias = false;
+                if (bias != null)
+                {
+                    if (bias.Storage is D3D11TensorStorage<float> devBias)
+                    {
+                        biasBuf = devBias.Buffer;
+                    }
+                    else
+                    {
+                        biasBuf = CreateStructuredBuffer<float>(bias.Length, allowUav: false, cpuRead: false);
+                        biasBuf.Upload(bias.ToContiguous().AsReadOnlySpan());
+                        isTempBias = true;
+                    }
+                }
+
+                try
+                {
+                    uint actVal = 0;
+                    if (activation == ComputeActivationType.ReLU) actVal = 1;
+                    else if (activation == ComputeActivationType.GELU) actVal = 2;
+                    else if (activation == ComputeActivationType.SiLU) actVal = 3;
+
+                    var cbData = new FusedGemmCbData
+                    {
+                        M = (uint)M,
+                        K = (uint)K,
+                        N = (uint)N,
+                        Alpha = alpha,
+                        HasBias = (uint)(bias != null ? 1 : 0),
+                        ActType = actVal
+                    };
+                    D3D11Native.UpdateSubresource(_context, _fusedGemmCb, (IntPtr)(&cbData));
+                    D3D11Native.CSSetConstantBuffers(_context, 0, _fusedGemmCb);
+
+                    var srvList = new System.Collections.Generic.List<D3D11ComputeBuffer> { srvA, srvB };
+                    if (biasBuf != null) srvList.Add(biasBuf);
+
+                    int groupsX = (N + 15) / 16;
+                    int groupsY = (M + 15) / 16;
+                    DispatchShader(_fusedGemmShader, groupsX, groupsY, 1, new[] { scopeC.Buffer }, srvList.ToArray());
+
+                    if (needsDownload)
+                    {
+                        var cContig = C.ToContiguous();
+                        scopeC.Buffer.Download(cContig.AsSpan());
+                        if (!ReferenceEquals(cContig, C)) cContig.CopyTo(C);
+                    }
+                }
+                finally
+                {
+                    scratchA?.Dispose();
+                    scratchB?.Dispose();
+                    if (isTempBias && biasBuf != null) biasBuf.Dispose();
+                }
+            }
+            catch
+            {
+                BlasEngine.FusedGemm(A, B, bias, C, activation, alpha);
+            }
+        }
+
+        public unsafe void FusedResidualRmsNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            float epsilon = 1e-5f)
+        {
+            if (!_isHardwareAccelerated)
+            {
+                BlasEngine.FusedResidualRmsNorm(input, residual, output, weight, epsilon);
+                return;
+            }
+
+            try
+            {
+                EnsureFusedResRmsNormPipeline();
+
+                int rank = input.Rank;
+                int hiddenDim = input.Shape[rank - 1];
+                int rowCount = input.Length / hiddenDim;
+
+                using var scopeIn = BindInputBuffer(input, allowUav: false);
+                using var scopeRes = BindInputBuffer(residual, allowUav: false);
+                using var scopeOut = BindOutputBuffer(output, out bool needsDownload);
+
+                D3D11ComputeBuffer srvIn = scopeIn.Buffer;
+                D3D11ComputeBuffer srvRes = scopeRes.Buffer;
+                D3D11ComputeBuffer? scratchIn = null;
+                D3D11ComputeBuffer? scratchRes = null;
+
+                if (scopeIn.Buffer.BufferHandle == scopeOut.Buffer.BufferHandle)
+                {
+                    scratchIn = CreateStructuredBuffer<float>(input.Length, allowUav: false, cpuRead: false);
+                    D3D11Native.CopyResource(_context, scratchIn.BufferHandle, scopeIn.Buffer.BufferHandle);
+                    srvIn = scratchIn;
+                }
+                if (scopeRes.Buffer.BufferHandle == scopeOut.Buffer.BufferHandle)
+                {
+                    scratchRes = CreateStructuredBuffer<float>(residual.Length, allowUav: false, cpuRead: false);
+                    D3D11Native.CopyResource(_context, scratchRes.BufferHandle, scopeRes.Buffer.BufferHandle);
+                    srvRes = scratchRes;
+                }
+
+                D3D11ComputeBuffer? wBuf = null;
+                bool isTempW = false;
+                if (weight != null)
+                {
+                    if (weight.Storage is D3D11TensorStorage<float> devW) wBuf = devW.Buffer;
+                    else
+                    {
+                        wBuf = CreateStructuredBuffer<float>(weight.Length, allowUav: false, cpuRead: false);
+                        wBuf.Upload(weight.ToContiguous().AsReadOnlySpan());
+                        isTempW = true;
+                    }
+                }
+
+                try
+                {
+                    var cbData = new FusedResRmsNormCbData
+                    {
+                        HiddenDim = (uint)hiddenDim,
+                        RowCount = (uint)rowCount,
+                        Epsilon = epsilon,
+                        HasWeight = (uint)(weight != null ? 1 : 0)
+                    };
+                    D3D11Native.UpdateSubresource(_context, _fusedResRmsNormCb, (IntPtr)(&cbData));
+                    D3D11Native.CSSetConstantBuffers(_context, 0, _fusedResRmsNormCb);
+
+                    var srvList = new System.Collections.Generic.List<D3D11ComputeBuffer> { srvIn, srvRes };
+                    if (wBuf != null) srvList.Add(wBuf);
+
+                    DispatchShader(_fusedResRmsNormShader, rowCount, 1, 1, new[] { scopeOut.Buffer }, srvList.ToArray());
+
+                    if (needsDownload)
+                    {
+                        var outContig = output.ToContiguous();
+                        scopeOut.Buffer.Download(outContig.AsSpan());
+                        if (!ReferenceEquals(outContig, output)) outContig.CopyTo(output);
+                    }
+                }
+                finally
+                {
+                    scratchIn?.Dispose();
+                    scratchRes?.Dispose();
+                    if (isTempW && wBuf != null) wBuf.Dispose();
+                }
+            }
+            catch
+            {
+                BlasEngine.FusedResidualRmsNorm(input, residual, output, weight, epsilon);
+            }
+        }
+
+        public void FusedResidualLayerNorm(
+            Tensor<float> input,
+            Tensor<float> residual,
+            Tensor<float> output,
+            Tensor<float>? weight = null,
+            Tensor<float>? bias = null,
+            float epsilon = 1e-5f)
+        {
+            BlasEngine.FusedResidualLayerNorm(input, residual, output, weight, bias, epsilon);
+        }
+
+        public unsafe void ScaledDotProductAttention(
+            Tensor<float> Q,
+            Tensor<float> K,
+            Tensor<float> V,
+            Tensor<float> output,
+            float? scale = null,
+            bool isCausal = false)
+        {
+            if (!_isHardwareAccelerated)
+            {
+                BlasEngine.ScaledDotProductAttention(Q, K, V, output, scale, isCausal);
+                return;
+            }
+
+            try
+            {
+                EnsureSdpaPipeline();
+
+                int rank = Q.Rank;
+                int D = Q.Shape[rank - 1];
+                int seqLenQ = Q.Shape[rank - 2];
+                int seqLenK = K.Shape[rank - 2];
+
+                int batchCount = 1;
+                for (int d = 0; d < rank - 2; d++) batchCount *= Q.Shape[d];
+
+                float s = scale ?? (1.0f / (float)Math.Sqrt(D));
+
+                using var scopeQ = BindInputBuffer(Q, allowUav: false);
+                using var scopeK = BindInputBuffer(K, allowUav: false);
+                using var scopeV = BindInputBuffer(V, allowUav: false);
+                using var scopeOut = BindOutputBuffer(output, out bool needsDownload);
+
+                var cbData = new SdpaCbData
+                {
+                    SeqLenQ = (uint)seqLenQ,
+                    SeqLenK = (uint)seqLenK,
+                    HeadDim = (uint)D,
+                    BatchCount = (uint)batchCount,
+                    Scale = s,
+                    IsCausal = (uint)(isCausal ? 1 : 0)
+                };
+                D3D11Native.UpdateSubresource(_context, _sdpaCb, (IntPtr)(&cbData));
+                D3D11Native.CSSetConstantBuffers(_context, 0, _sdpaCb);
+
+                DispatchShader(_sdpaShader, seqLenQ, batchCount, 1, new[] { scopeOut.Buffer }, new[] { scopeQ.Buffer, scopeK.Buffer, scopeV.Buffer });
+
+                if (needsDownload)
+                {
+                    var outContig = output.ToContiguous();
+                    scopeOut.Buffer.Download(outContig.AsSpan());
+                    if (!ReferenceEquals(outContig, output)) outContig.CopyTo(output);
+                }
+            }
+            catch
+            {
+                BlasEngine.ScaledDotProductAttention(Q, K, V, output, scale, isCausal);
+            }
+        }
+
+        public void Gemm(Tensor<Half> A, Tensor<Half> B, Tensor<Half> C)
+        {
+            BlasEngine.Gemm(A, B, C);
+        }
+
+        #endregion
+
         #endregion
 
         public void Dispose()
@@ -969,6 +1324,9 @@ namespace ZeroCompute.Core.DirectX
                 if (_rmsNormShader != IntPtr.Zero) { D3D11Native.Release(_rmsNormShader); _rmsNormShader = IntPtr.Zero; }
                 if (_layerNormShader != IntPtr.Zero) { D3D11Native.Release(_layerNormShader); _layerNormShader = IntPtr.Zero; }
                 if (_softmaxShader != IntPtr.Zero) { D3D11Native.Release(_softmaxShader); _softmaxShader = IntPtr.Zero; }
+                if (_fusedGemmShader != IntPtr.Zero) { D3D11Native.Release(_fusedGemmShader); _fusedGemmShader = IntPtr.Zero; }
+                if (_fusedResRmsNormShader != IntPtr.Zero) { D3D11Native.Release(_fusedResRmsNormShader); _fusedResRmsNormShader = IntPtr.Zero; }
+                if (_sdpaShader != IntPtr.Zero) { D3D11Native.Release(_sdpaShader); _sdpaShader = IntPtr.Zero; }
 
                 if (_gemmCb != IntPtr.Zero) { D3D11Native.Release(_gemmCb); _gemmCb = IntPtr.Zero; }
                 if (_batchedGemmCb != IntPtr.Zero) { D3D11Native.Release(_batchedGemmCb); _batchedGemmCb = IntPtr.Zero; }
@@ -977,6 +1335,9 @@ namespace ZeroCompute.Core.DirectX
                 if (_rmsNormCb != IntPtr.Zero) { D3D11Native.Release(_rmsNormCb); _rmsNormCb = IntPtr.Zero; }
                 if (_layerNormCb != IntPtr.Zero) { D3D11Native.Release(_layerNormCb); _layerNormCb = IntPtr.Zero; }
                 if (_softmaxCb != IntPtr.Zero) { D3D11Native.Release(_softmaxCb); _softmaxCb = IntPtr.Zero; }
+                if (_fusedGemmCb != IntPtr.Zero) { D3D11Native.Release(_fusedGemmCb); _fusedGemmCb = IntPtr.Zero; }
+                if (_fusedResRmsNormCb != IntPtr.Zero) { D3D11Native.Release(_fusedResRmsNormCb); _fusedResRmsNormCb = IntPtr.Zero; }
+                if (_sdpaCb != IntPtr.Zero) { D3D11Native.Release(_sdpaCb); _sdpaCb = IntPtr.Zero; }
 
                 if (_context != IntPtr.Zero)
                 {
