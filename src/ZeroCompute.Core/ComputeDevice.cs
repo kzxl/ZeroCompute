@@ -22,6 +22,7 @@ namespace ZeroCompute.Core
         public ComputeBackend Backend { get; }
         public bool IsHardwareAccelerated => _d3d11Context?.IsHardwareAccelerated ?? false;
         public ZeroCompute.Core.DirectX.D3D11ComputeContext? D3D11Context => _d3d11Context;
+        public ZeroCompute.Core.DirectX.D3D11BufferPool? BufferPool => _d3d11Context?.BufferPool;
 
         public ComputeDevice(ComputeBackend backend = ComputeBackend.CpuParallel)
         {
@@ -55,12 +56,13 @@ namespace ZeroCompute.Core
 
         /// <summary>
         /// Allocates a GPU VRAM-resident tensor if running on Direct3D 11, otherwise allocates a host CPU tensor.
+        /// When pooled is true, uses the VRAM buffer pool for zero driver allocation overhead.
         /// </summary>
-        public Tensor<T> AllocateDeviceTensor<T>(TensorShape shape) where T : unmanaged, IEquatable<T>
+        public Tensor<T> AllocateDeviceTensor<T>(TensorShape shape, bool pooled = false) where T : unmanaged, IEquatable<T>
         {
             if (_d3d11Context != null && _d3d11Context.IsHardwareAccelerated)
             {
-                return _d3d11Context.AllocateDeviceTensor<T>(shape);
+                return _d3d11Context.AllocateDeviceTensor<T>(shape, pooled);
             }
             return new Tensor<T>(shape);
         }
@@ -243,6 +245,32 @@ namespace ZeroCompute.Core
                 _d3d11Context.Gemm(A, B, C);
             else
                 BlasEngine.Gemm(A, B, C);
+        }
+
+        public void GemmInt8(
+            Tensor<float> A,
+            Tensor<sbyte> B,
+            Tensor<float> scales,
+            Tensor<float> C,
+            Tensor<float>? zeroPoints = null)
+        {
+            if (_d3d11Context != null && _d3d11Context.IsHardwareAccelerated)
+                _d3d11Context.GemmInt8(A, B, scales, C, zeroPoints);
+            else
+                BlasEngine.GemmInt8(A, B, scales, C, zeroPoints);
+        }
+
+        public void GemmInt4(
+            Tensor<float> A,
+            Tensor<byte> packedWeights,
+            Tensor<float> scales,
+            Tensor<float> C,
+            Tensor<float>? zeroPoints = null)
+        {
+            if (_d3d11Context != null && _d3d11Context.IsHardwareAccelerated)
+                _d3d11Context.GemmInt4(A, packedWeights, scales, C, zeroPoints);
+            else
+                BlasEngine.GemmInt4(A, packedWeights, scales, C, zeroPoints);
         }
 
         public void Dispose()

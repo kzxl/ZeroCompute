@@ -115,6 +115,26 @@ namespace ZeroCompute.Core.Context
         void Gemm(Tensor<Half> A, Tensor<Half> B, Tensor<Half> C);
 
         /// <summary>
+        /// Quantized INT8 General Matrix Multiplication: C = scale * (A @ (B - zp)).
+        /// </summary>
+        void GemmInt8(
+            Tensor<float> A,
+            Tensor<sbyte> B,
+            Tensor<float> scales,
+            Tensor<float> C,
+            Tensor<float>? zeroPoints = null);
+
+        /// <summary>
+        /// Quantized Packed INT4 General Matrix Multiplication: C = scale * (A @ (W_dequant - zp)).
+        /// </summary>
+        void GemmInt4(
+            Tensor<float> A,
+            Tensor<byte> packedWeights,
+            Tensor<float> scales,
+            Tensor<float> C,
+            Tensor<float>? zeroPoints = null);
+
+        /// <summary>
         /// Reduces tensor along the specified axis (e.g., sum, max).
         /// </summary>
         Tensor<float> ReduceSum(Tensor<float> input, int axis);

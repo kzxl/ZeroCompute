@@ -13,6 +13,7 @@ namespace ZeroCompute.Core.DirectX
     {
         private readonly D3D11ComputeBuffer _buffer;
         private readonly bool _ownsBuffer;
+        private readonly D3D11BufferPool? _originPool;
         private bool _disposed;
 
         public DeviceType Device => DeviceType.Direct3D11;
@@ -31,10 +32,11 @@ namespace ZeroCompute.Core.DirectX
         /// </summary>
         public IntPtr DeviceHandle => _buffer.BufferHandle;
 
-        public D3D11TensorStorage(D3D11ComputeBuffer buffer, bool ownsBuffer = true)
+        public D3D11TensorStorage(D3D11ComputeBuffer buffer, bool ownsBuffer = true, D3D11BufferPool? originPool = null)
         {
             _buffer = buffer ?? throw new ArgumentNullException(nameof(buffer));
             _ownsBuffer = ownsBuffer;
+            _originPool = originPool;
         }
 
         public Span<T> AsSpan(int offset, int length)
@@ -110,7 +112,11 @@ namespace ZeroCompute.Core.DirectX
         {
             if (!_disposed)
             {
-                if (_ownsBuffer)
+                if (_originPool != null)
+                {
+                    _originPool.Return(_buffer);
+                }
+                else if (_ownsBuffer)
                 {
                     _buffer.Dispose();
                 }

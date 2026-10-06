@@ -1370,6 +1370,180 @@ namespace ZeroCompute.Core.Blas
             }
         }
 
+        #region Quantized INT8 and INT4 GEMM
+
+        /// <summary>
+        /// Computes General Matrix Multiplication with INT8 weights and FP32 activations:
+        /// C[m, n] = scale[n] * sum_k( A[m, k] * (B[k, n] - zp[n]) ).
+        /// </summary>
+        public static unsafe void GemmInt8(
+            Tensor<float> A,
+            Tensor<sbyte> B,
+            Tensor<float> scales,
+            Tensor<float> C,
+            Tensor<float>? zeroPoints = null)
+        {
+            if (A == null) throw new ArgumentNullException(nameof(A));
+            if (B == null) throw new ArgumentNullException(nameof(B));
+            if (scales == null) throw new ArgumentNullException(nameof(scales));
+            if (C == null) throw new ArgumentNullException(nameof(C));
+
+            int M = A.Shape[0];
+            int K = A.Shape[1];
+            int N = B.Shape[1];
+
+            if (B.Shape[0] != K)
+                throw new ArgumentException($"Inner dimensions must match: A is [{M},{K}], B is [{B.Shape[0]},{N}].");
+            if (scales.Length < N)
+                throw new ArgumentException($"Scales length {scales.Length} must be at least N={N}.");
+
+            var aContig = A.IsContiguous ? A : A.ToContiguous();
+            var bContig = B.IsContiguous ? B : B.ToContiguous();
+            var sContig = scales.IsContiguous ? scales : scales.ToContiguous();
+            var cContig = C.IsContiguous ? C : C.ToContiguous();
+            var zpContig = zeroPoints != null ? (zeroPoints.IsContiguous ? zeroPoints : zeroPoints.ToContiguous()) : null;
+
+            fixed (float* pA = aContig.AsSpan())
+            fixed (sbyte* pB = bContig.AsSpan())
+            fixed (float* pScales = sContig.AsSpan())
+            fixed (float* pC = cContig.AsSpan())
+            fixed (float* pZp = zpContig != null ? zpContig.AsSpan() : default)
+            {
+                IntPtr ptrA = (IntPtr)pA;
+                IntPtr ptrB = (IntPtr)pB;
+                IntPtr ptrS = (IntPtr)pScales;
+                IntPtr ptrC = (IntPtr)pC;
+                IntPtr ptrZp = (IntPtr)pZp;
+
+                Compute.For(M, i =>
+                {
+                    float* aRow = (float*)ptrA + i * K;
+                    float* cRow = (float*)ptrC + i * N;
+                    sbyte* bBase = (sbyte*)ptrB;
+                    float* sVec = (float*)ptrS;
+                    float* zpVec = (float*)ptrZp;
+
+                    for (int j = 0; j < N; j++)
+                    {
+                        float scale = sVec[j];
+                        float zp = zpVec != null ? zpVec[j] : 0.0f;
+                        float acc = 0.0f;
+
+                        int k = 0;
+                        for (; k <= K - 4; k += 4)
+                        {
+                            acc += aRow[k] * ((float)bBase[k * N + j] - zp);
+                            acc += aRow[k + 1] * ((float)bBase[(k + 1) * N + j] - zp);
+                            acc += aRow[k + 2] * ((float)bBase[(k + 2) * N + j] - zp);
+                            acc += aRow[k + 3] * ((float)bBase[(k + 3) * N + j] - zp);
+                        }
+                        for (; k < K; k++)
+                        {
+                            acc += aRow[k] * ((float)bBase[k * N + j] - zp);
+                        }
+
+                        cRow[j] = acc * scale;
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
+
+            if (!ReferenceEquals(cContig, C))
+            {
+                cContig.CopyTo(C);
+            }
+        }
+
+        /// <summary>
+        /// Computes General Matrix Multiplication with packed INT4 weights and FP32 activations:
+        /// Each byte in packedWeights stores two 4-bit nibbles (low nibble = row 2*l, high nibble = row 2*l+1).
+        /// C[m, n] = scale[n] * sum_k( A[m, k] * (W_dequant[k, n] - zp[n]) ).
+        /// </summary>
+        public static unsafe void GemmInt4(
+            Tensor<float> A,
+            Tensor<byte> packedWeights,
+            Tensor<float> scales,
+            Tensor<float> C,
+            Tensor<float>? zeroPoints = null)
+        {
+            if (A == null) throw new ArgumentNullException(nameof(A));
+            if (packedWeights == null) throw new ArgumentNullException(nameof(packedWeights));
+            if (scales == null) throw new ArgumentNullException(nameof(scales));
+            if (C == null) throw new ArgumentNullException(nameof(C));
+
+            int M = A.Shape[0];
+            int K = A.Shape[1];
+            int packedK = packedWeights.Shape[0];
+            int N = packedWeights.Shape[1];
+
+            if (packedK != (K + 1) / 2)
+                throw new ArgumentException($"Inner dimension mismatch: A is [{M},{K}], but packedWeights is [{packedK},{N}] (expected {(K + 1) / 2}).");
+            if (scales.Length < N)
+                throw new ArgumentException($"Scales length {scales.Length} must be at least N={N}.");
+
+            var aContig = A.IsContiguous ? A : A.ToContiguous();
+            var wContig = packedWeights.IsContiguous ? packedWeights : packedWeights.ToContiguous();
+            var sContig = scales.IsContiguous ? scales : scales.ToContiguous();
+            var cContig = C.IsContiguous ? C : C.ToContiguous();
+            var zpContig = zeroPoints != null ? (zeroPoints.IsContiguous ? zeroPoints : zeroPoints.ToContiguous()) : null;
+
+            fixed (float* pA = aContig.AsSpan())
+            fixed (byte* pW = wContig.AsSpan())
+            fixed (float* pScales = sContig.AsSpan())
+            fixed (float* pC = cContig.AsSpan())
+            fixed (float* pZp = zpContig != null ? zpContig.AsSpan() : default)
+            {
+                IntPtr ptrA = (IntPtr)pA;
+                IntPtr ptrW = (IntPtr)pW;
+                IntPtr ptrS = (IntPtr)pScales;
+                IntPtr ptrC = (IntPtr)pC;
+                IntPtr ptrZp = (IntPtr)pZp;
+
+                Compute.For(M, i =>
+                {
+                    float* aRow = (float*)ptrA + i * K;
+                    float* cRow = (float*)ptrC + i * N;
+                    byte* wBase = (byte*)ptrW;
+                    float* sVec = (float*)ptrS;
+                    float* zpVec = (float*)ptrZp;
+
+                    for (int j = 0; j < N; j++)
+                    {
+                        float scale = sVec[j];
+                        float zp = zpVec != null ? zpVec[j] : 0.0f;
+                        float acc = 0.0f;
+
+                        for (int l = 0; l < packedK; l++)
+                        {
+                            byte packed = wBase[l * N + j];
+                            int nibble0 = packed & 0x0F;
+                            int nibble1 = (packed >> 4) & 0x0F;
+
+                            int k0 = l * 2;
+                            int k1 = k0 + 1;
+
+                            float w0 = ((float)nibble0 - zp);
+                            acc += aRow[k0] * w0;
+
+                            if (k1 < K)
+                            {
+                                float w1 = ((float)nibble1 - zp);
+                                acc += aRow[k1] * w1;
+                            }
+                        }
+
+                        cRow[j] = acc * scale;
+                    }
+                }, CpuWorkloadType.ComputeBound);
+            }
+
+            if (!ReferenceEquals(cContig, C))
+            {
+                cContig.CopyTo(C);
+            }
+        }
+
+        #endregion
+
         #endregion
     }
 }

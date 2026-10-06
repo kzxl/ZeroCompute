@@ -33,6 +33,8 @@ namespace ZeroCompute.Benchmarks
             RunBenchmark10_GpuResidencyChained();
             RunBenchmark11_FusedGemm();
             RunBenchmark12_FlashAttention();
+            RunBenchmark13_BufferPoolRecycling();
+            RunBenchmark14_QuantizedGemmInt4();
 
             Console.WriteLine("\n[DONE] Benchmark suite finished successfully.");
         }
@@ -704,6 +706,132 @@ namespace ZeroCompute.Benchmarks
             Console.WriteLine($"[Sequence Length 512, Head Dim 64 - 10 runs averaged]");
             Console.WriteLine($"  * Materialized Attention (Allocates 512x512 matrix): {tMaterialized,8:F2} ms (1.00x)");
             Console.WriteLine($"  * FlashAttention-2 Online Softmax (O(1) Memory)     : {tFlash,8:F2} ms ({(tMaterialized / tFlash),5:F2}x speedup | 0 intermediate matrices)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 13: VRAM Slab Buffer Pool Recycling vs Native Driver Allocation
+
+        private static void RunBenchmark13_BufferPoolRecycling()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 13: VRAM Slab Buffer Pool vs OS Driver Buffer Allocation (LLM Steps)");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            if (!ZeroCompute.Core.ComputeDevice.IsGpuAvailable)
+            {
+                Console.WriteLine("  [SKIPPED] GPU acceleration not available.");
+                Console.WriteLine();
+                return;
+            }
+
+            var ctx = ZeroCompute.Core.ComputeDevice.Gpu.D3D11Context!;
+            var shape = new ZeroTensor.Core.TensorShape(128, 4096); // 512K floats = 2MB buffer
+            const int iters = 100;
+
+            // 1. Unpooled: calling OS Display Driver CreateBuffer + Release on every forward-pass iteration
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                using var t = ctx.AllocateDeviceTensor<float>(shape, pooled: false);
+            }
+            sw.Stop();
+            double tUnpooled = sw.Elapsed.TotalMilliseconds;
+
+            // 2. Pooled: recycling pre-allocated VRAM buffer from D3D11BufferPool
+            var pool = ctx.BufferPool!;
+            long hitsBefore = pool.CacheHitCount;
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                using var t = ctx.AllocateDeviceTensor<float>(shape, pooled: true);
+            }
+            sw.Stop();
+            double tPooled = sw.Elapsed.TotalMilliseconds;
+            long hitsAfter = pool.CacheHitCount;
+
+            Console.WriteLine($"[Buffer: 128x4096 (2.0 MB VRAM) - {iters} Alloc/Dealloc Iterations]");
+            Console.WriteLine($"  * Unpooled (Direct3D 11 OS Driver Allocation): {tUnpooled,8:F2} ms ({(tUnpooled / iters),6:F3} ms/iter)");
+            Console.WriteLine($"  * Pooled   (ZeroCompute D3D11BufferPool)     : {tPooled,8:F2} ms ({(tPooled / iters),6:F3} ms/iter | {(tUnpooled / tPooled),5:F2}x speedup | {hitsAfter - hitsBefore}/{iters} hits)");
+            Console.WriteLine();
+        }
+
+        #endregion
+
+        #region Benchmark 14: Quantized INT4 GEMM (AWQ/GPTQ) vs FP32 Dense GEMM
+
+        private static void RunBenchmark14_QuantizedGemmInt4()
+        {
+            Console.WriteLine("--------------------------------------------------------------------------------");
+            Console.WriteLine("BENCHMARK 14: Quantized INT4 GEMM (AWQ/GPTQ) vs Dense FP32 GEMM");
+            Console.WriteLine("--------------------------------------------------------------------------------");
+
+            const int M = 32;
+            const int K = 1024;
+            const int N = 1024;
+            const int packedK = K / 2; // 512
+
+            var A = ZeroTensor.Core.Tensor.Ones<float>(M, K);
+
+            // FP32 weight matrix: 1024 x 1024 floats = 4 MB
+            var W_fp32 = ZeroTensor.Core.Tensor.Ones<float>(K, N);
+            var C_fp32 = ZeroTensor.Core.Tensor.Zeros<float>(M, N);
+
+            // INT4 packed weights: 512 x 1024 bytes = 0.5 MB (8x reduction vs FP32!)
+            var packedW = new ZeroTensor.Core.Tensor<byte>(packedK, N);
+            packedW.Fill(0x33); // 2 nibbles of 3
+            var scales = ZeroTensor.Core.Tensor.Ones<float>(N);
+            var zp = ZeroTensor.Core.Tensor.Zeros<float>(N);
+            var C_int4 = ZeroTensor.Core.Tensor.Zeros<float>(M, N);
+
+            const int iters = 5;
+
+            // 1. FP32 GEMM Baseline
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++)
+            {
+                ZeroCompute.Core.Blas.BlasEngine.Gemm(A, W_fp32, C_fp32);
+            }
+            sw.Stop();
+            double tFp32 = sw.Elapsed.TotalMilliseconds / iters;
+
+            // 2. CPU INT4 GEMM
+            sw.Restart();
+            for (int i = 0; i < iters; i++)
+            {
+                ZeroCompute.Core.ComputeDevice.Cpu.GemmInt4(A, packedW, scales, C_int4, zp);
+            }
+            sw.Stop();
+            double tCpuInt4 = sw.Elapsed.TotalMilliseconds / iters;
+
+            // 3. GPU INT4 GEMM (if available)
+            double tGpuInt4 = 0;
+            if (ZeroCompute.Core.ComputeDevice.IsGpuAvailable)
+            {
+                var gpuC = ZeroTensor.Core.Tensor.Zeros<float>(M, N);
+                // Warm up pipeline
+                ZeroCompute.Core.ComputeDevice.Gpu.GemmInt4(A, packedW, scales, gpuC, zp);
+
+                sw.Restart();
+                for (int i = 0; i < iters; i++)
+                {
+                    ZeroCompute.Core.ComputeDevice.Gpu.GemmInt4(A, packedW, scales, gpuC, zp);
+                }
+                sw.Stop();
+                tGpuInt4 = sw.Elapsed.TotalMilliseconds / iters;
+            }
+
+            double fp32Mb = (K * N * 4.0) / (1024 * 1024);
+            double int4Mb = (packedK * N * 1.0) / (1024 * 1024);
+
+            Console.WriteLine($"[Matrix Size: {M} x {K} x {N} | Weight Memory: FP32={fp32Mb:F2} MB, INT4={int4Mb:F2} MB ({(fp32Mb / int4Mb),4:F1}x Memory Compression)]");
+            Console.WriteLine($"  * CPU FP32 Dense GEMM (AVX2+FMA)  : {tFp32,8:F2} ms (1.00x)");
+            Console.WriteLine($"  * CPU INT4 Quantized GEMM         : {tCpuInt4,8:F2} ms ({(tFp32 / tCpuInt4),5:F2}x vs FP32)");
+            if (ZeroCompute.Core.ComputeDevice.IsGpuAvailable)
+            {
+                Console.WriteLine($"  * GPU INT4 Quantized CS 5.0 GEMM  : {tGpuInt4,8:F2} ms ({(tFp32 / tGpuInt4),5:F2}x vs CPU FP32)");
+            }
             Console.WriteLine();
         }
 

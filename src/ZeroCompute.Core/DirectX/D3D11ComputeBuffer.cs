@@ -24,6 +24,10 @@ namespace ZeroCompute.Core.DirectX
         public IntPtr BufferHandle => _bufferHandle;
         public IntPtr UavHandle => _uavHandle;
         public IntPtr SrvHandle => _srvHandle;
+        public bool HasUav => _uavHandle != IntPtr.Zero;
+        public bool HasSrv => _srvHandle != IntPtr.Zero;
+        public bool HasStaging => _stagingBufferHandle != IntPtr.Zero;
+        public bool IsDisposed => _disposed;
 
         internal D3D11ComputeBuffer(IntPtr device, IntPtr context, int elementCount, int elementStride, bool createUav, bool createSrv, bool allowCpuRead, object? syncLock = null)
         {
@@ -125,6 +129,26 @@ namespace ZeroCompute.Core.DirectX
         {
             if (data == null) throw new ArgumentNullException(nameof(data));
             Upload((ReadOnlySpan<T>)data.AsSpan());
+        }
+
+        public unsafe void UploadBytes(ReadOnlySpan<byte> data)
+        {
+            if (data.Length > TotalByteWidth)
+                throw new ArgumentException($"Data length {data.Length} bytes exceeds buffer capacity {TotalByteWidth} bytes.");
+
+            lock (_syncLock)
+            {
+                fixed (byte* ptr = data)
+                {
+                    D3D11Native.UpdateSubresource(_context, _bufferHandle, (IntPtr)ptr);
+                }
+            }
+        }
+
+        public unsafe void UploadBytes(byte[] data)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            UploadBytes(data.AsSpan());
         }
 
         public unsafe void Download<T>(Span<T> destination) where T : unmanaged

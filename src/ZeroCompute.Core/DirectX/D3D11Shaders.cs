@@ -610,5 +610,120 @@ void CSSdpaAttention(uint3 threadId : SV_GroupThreadID, uint3 groupId : SV_Group
     }
 }
 ";
+
+        public const string Int8GemmShaderSource = @"
+cbuffer QuantGemmCb : register(b0)
+{
+    uint M;
+    uint K;
+    uint N;
+    uint HasZeroPoint;
+    float Pad0;
+    float Pad1;
+    float Pad2;
+    float Pad3;
+};
+
+StructuredBuffer<float> A : register(t0);
+StructuredBuffer<uint> B_Packed : register(t1);
+StructuredBuffer<float> Scales : register(t2);
+StructuredBuffer<float> ZeroPoints : register(t3);
+
+RWStructuredBuffer<float> C : register(u0);
+
+[numthreads(16, 16, 1)]
+void CSInt8Gemm(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint col = dispatchThreadId.x;
+    uint row = dispatchThreadId.y;
+
+    if (row >= M || col >= N) return;
+
+    float scale = Scales[col];
+    float zp = HasZeroPoint != 0 ? ZeroPoints[col] : 0.0f;
+
+    float acc = 0.0f;
+    uint rowOffsetA = row * K;
+
+    for (uint k = 0; k < K; k++)
+    {
+        uint weightIdx = k * N + col;
+        uint uintIdx = weightIdx >> 2;
+        uint byteShift = (weightIdx & 3) << 3;
+        uint packedVal = B_Packed[uintIdx];
+        uint rawByte = (packedVal >> byteShift) & 0xFF;
+
+        int sVal = (int)rawByte;
+        if (sVal >= 128) sVal -= 256;
+
+        float dequantWeight = ((float)sVal - zp);
+        acc += A[rowOffsetA + k] * dequantWeight;
+    }
+
+    C[row * N + col] = acc * scale;
+}
+";
+
+        public const string Int4GemmShaderSource = @"
+cbuffer QuantGemmCb : register(b0)
+{
+    uint M;
+    uint K;
+    uint N;
+    uint HasZeroPoint;
+    float Pad0;
+    float Pad1;
+    float Pad2;
+    float Pad3;
+};
+
+StructuredBuffer<float> A : register(t0);
+StructuredBuffer<uint> B_Packed : register(t1);
+StructuredBuffer<float> Scales : register(t2);
+StructuredBuffer<float> ZeroPoints : register(t3);
+
+RWStructuredBuffer<float> C : register(u0);
+
+[numthreads(16, 16, 1)]
+void CSInt4Gemm(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint col = dispatchThreadId.x;
+    uint row = dispatchThreadId.y;
+
+    if (row >= M || col >= N) return;
+
+    float scale = Scales[col];
+    float zp = HasZeroPoint != 0 ? ZeroPoints[col] : 0.0f;
+
+    float acc = 0.0f;
+    uint rowOffsetA = row * K;
+    uint packedK = (K + 1) >> 1;
+
+    for (uint l = 0; l < packedK; l++)
+    {
+        uint bIdx = l * N + col;
+        uint uintIdx = bIdx >> 2;
+        uint byteShift = (bIdx & 3) << 3;
+        uint packedByte = (B_Packed[uintIdx] >> byteShift) & 0xFF;
+
+        uint nibble0 = packedByte & 0x0F;
+        uint nibble1 = (packedByte >> 4) & 0x0F;
+
+        uint k0 = l << 1;
+        uint k1 = k0 + 1;
+
+        float w0 = ((float)nibble0 - zp);
+        acc += A[rowOffsetA + k0] * w0;
+
+        if (k1 < K)
+        {
+            float w1 = ((float)nibble1 - zp);
+            acc += A[rowOffsetA + k1] * w1;
+        }
+    }
+
+    C[row * N + col] = acc * scale;
+}
+";
     }
 }
